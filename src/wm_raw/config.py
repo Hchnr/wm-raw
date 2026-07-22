@@ -50,8 +50,8 @@ class CrossAttentionConfig:
     """Cross-attention from VLM hidden states to diffusion branch."""
 
     enabled: bool = True
-    # Only cross_kv_down is implemented in wm-raw
-    communication_policy: str = "cross_kv_down"
+    # cross_kv_concat: concat VLM KV to diffusion self-attention KV
+    communication_policy: str = "cross_kv_concat"
     gate_init: float = 0.01
     zero_init_output: bool = False
     norm_eps: float = 1e-6
@@ -62,14 +62,15 @@ class CrossAttentionConfig:
 class LatentConfig:
     """Image latent tokenization settings."""
 
-    # VAE latent shape: [C, H, W] for 256x256 images with BAGEL AE
-    latent_channels: int = 64
-    latent_height: int = 16
-    latent_width: int = 16
-    # Patchify: 2x2 patches → 256 tokens of dim 256
+    # VAE latent shape: [C, H, W] for 256x256 images with BAGEL AE (downsample 8x)
+    latent_channels: int = 16
+    latent_height: int = 32
+    latent_width: int = 32
+    # Patchify: 2x2 patches → 256 tokens of dim 64
+    # num_tokens = (H/P)*(W/P) = 256, token_dim = P*P*C = 64
     patch_size: int = 2
-    # After patchify: num_tokens = (H/P)*(W/P) = 64, token_dim = P*P*C = 256
     position_embedding: str = "bagel_2d_sincos"
+    max_position_size: int = 64
 
 
 @dataclass(frozen=True)
@@ -89,10 +90,11 @@ class DiffusionConfig:
 
     # Diffusion objective
     prediction_type: str = "flow"  # flow matching velocity prediction
-    timestep_shift: float = 1.0
+    timestep_shift: float = 2.0
+    timestep_frequency_dim: int = 256
 
-    # Target
-    target_dim: int = 16  # state_target_dim from config
+    # Target (state_target_dim: patchified latent token dim = P*P*C = 2*2*16 = 64)
+    target_dim: int = 64
 
 
 @dataclass(frozen=True)
@@ -122,8 +124,12 @@ class WorldModelConfig:
 
     def validate(self) -> None:
         """Check config consistency."""
-        if self.cross_attention.communication_policy != "cross_kv_down":
-            raise ValueError("wm-raw only supports cross_kv_down communication policy")
+        supported_policies = ("cross_kv_down", "cross_kv_concat")
+        if self.cross_attention.communication_policy not in supported_policies:
+            raise ValueError(
+                f"wm-raw only supports {supported_policies}, "
+                f"got {self.cross_attention.communication_policy!r}"
+            )
         if self.diffusion.prediction_type != "flow":
             raise ValueError("wm-raw only supports flow matching prediction type")
         if self.latent.patch_size < 1:

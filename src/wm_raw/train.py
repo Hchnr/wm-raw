@@ -107,6 +107,12 @@ def main() -> None:
     tc.wandb_project = log_cfg.get("wandb_project", "wm-raw")
     tc.wandb_name = log_cfg.get("wandb_name", "")
 
+    # EMA
+    ema_cfg = raw_config.get("ema", {})
+    tc.ema_enabled = bool(ema_cfg.get("enabled", False))
+    tc.ema_decay = float(ema_cfg.get("decay", 0.9999))
+    tc.ema_warmup_steps = int(ema_cfg.get("warmup_steps", 0))
+
     # Compute dtype
     tc.compute_dtype = model_cfg.get("torch_dtype", "bfloat16")
 

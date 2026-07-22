@@ -26,6 +26,8 @@ from wm_raw.checkpoint import (
     load_hf_safetensors,
     _map_vlm_key,
     _map_diffusion_key,
+    _find_hf_text_model_prefix,
+    _find_hf_vision_prefix,
 )
 
 # Real model paths
@@ -85,26 +87,61 @@ def test_key_mapping_coverage():
 
     # Load HF state dict keys (don't load tensors to GPU)
     vlm_sd = load_hf_safetensors(VLM_PATH)
+    print(f"{VLM_PATH=} loaded.")
     diff_sd = load_hf_safetensors(DIFFUSION_PATH)
+    print(f"{DIFFUSION_PATH=} loaded.")
 
-    # Check VLM key mapping
+    # Strip prefixes (same logic as load_vlm_weights)
+    text_prefix = _find_hf_text_model_prefix(vlm_sd)
+    vision_prefix = _find_hf_vision_prefix(vlm_sd)
+    print(f"  VLM detected prefixes: text='{text_prefix}', vision='{vision_prefix}'")
+
+    vlm_stripped: dict[str, object] = {}
+    for key in vlm_sd:
+        if text_prefix and key.startswith(text_prefix):
+            vlm_stripped[key[len(text_prefix):]] = vlm_sd[key]
+        elif vision_prefix and key.startswith(vision_prefix + "visual."):
+            vlm_stripped[key[len(vision_prefix):]] = vlm_sd[key]
+        elif key.startswith("visual."):
+            vlm_stripped[key] = vlm_sd[key]
+        elif key.startswith("lm_head."):
+            vlm_stripped[key] = vlm_sd[key]
+        else:
+            vlm_stripped[key] = vlm_sd[key]
+
+    # Check VLM key mapping (on stripped keys)
     vlm_mapped = 0
     vlm_unmapped = []
-    for key in vlm_sd:
+    for key in vlm_stripped:
         raw_key = _map_vlm_key(key)
         if raw_key is not None:
             vlm_mapped += 1
         else:
-            vlm_unmapped.append(key)
+            # fused QKV returns None intentionally
+            if "attn.qkv." in key:
+                vlm_mapped += 1  # handled by _split_vision_fused_qkv
+            else:
+                vlm_unmapped.append(key)
 
     print(f"  VLM: {vlm_mapped} mapped, {len(vlm_unmapped)} unmapped")
     if vlm_unmapped:
         print(f"  First 10 unmapped: {vlm_unmapped[:10]}")
 
-    # Check diffusion key mapping
+    # Strip prefix for diffusion (same logic as load_diffusion_weights)
+    diff_text_prefix = _find_hf_text_model_prefix(diff_sd)
+    print(f"  Diffusion detected text prefix: '{diff_text_prefix}'")
+
+    diff_stripped: dict[str, object] = {}
+    for key in diff_sd:
+        if diff_text_prefix and key.startswith(diff_text_prefix):
+            diff_stripped[key[len(diff_text_prefix):]] = diff_sd[key]
+        else:
+            diff_stripped[key] = diff_sd[key]
+
+    # Check diffusion key mapping (on stripped keys)
     diff_mapped = 0
     diff_unmapped = []
-    for key in diff_sd:
+    for key in diff_stripped:
         raw_key = _map_diffusion_key(key)
         if raw_key is not None:
             diff_mapped += 1
@@ -114,7 +151,10 @@ def test_key_mapping_coverage():
     print(f"  Diffusion: {diff_mapped} mapped, {len(diff_unmapped)} unmapped (expected: embed/lm_head/vision)")
     # Unmapped should only be embed_tokens, lm_head, visual.*
     unexpected_unmapped = [k for k in diff_unmapped if not any(
-        k.startswith(p) for p in ("model.embed_tokens", "lm_head", "visual.", "model.visual.")
+        k.startswith(p) for p in (
+            "embed_tokens", "model.embed_tokens", "lm_head",
+            "visual.", "model.visual.",
+        )
     )]
     if unexpected_unmapped:
         print(f"  WARNING: unexpected unmapped keys: {unexpected_unmapped[:10]}")

@@ -101,6 +101,11 @@ class TrainingConfig:
     train_diffusion_backbone: bool = True
     trainable_mode: str = "diffusion"  # "diffusion" | "all" | "vlm"
 
+    # EMA
+    ema_enabled: bool = False
+    ema_decay: float = 0.9999
+    ema_warmup_steps: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Distributed utilities
@@ -166,7 +171,7 @@ def apply_fsdp2(
         )
 
     # Shard VLM decoder layers
-    for layer in model.vlm.decoder.layers:
+    for layer in model.vlm.layers:
         fully_shard(layer, mp_policy=mp_policy, reshard_after_forward=True)
 
     # Shard VLM vision encoder blocks
@@ -174,13 +179,22 @@ def apply_fsdp2(
         for block in model.vlm.vision_encoder.blocks:
             fully_shard(block, mp_policy=mp_policy, reshard_after_forward=True)
 
+    # Shard VLM branch as a unit (captures embed_tokens, norm, lm_head)
+    fully_shard(model.vlm, mp_policy=mp_policy, reshard_after_forward=True)
+
     # Shard diffusion decoder layers
     for layer in model.state_diffusion.layers:
         fully_shard(layer, mp_policy=mp_policy, reshard_after_forward=True)
 
+    # Shard diffusion branch as a unit (captures input_proj, time_embedder, output_head, etc.)
+    fully_shard(model.state_diffusion, mp_policy=mp_policy, reshard_after_forward=True)
+
     # Shard cross-attention adapters
     for adapter in model.cross_attention.adapters:
         fully_shard(adapter, mp_policy=mp_policy, reshard_after_forward=True)
+
+    # Shard cross-attention as a unit
+    fully_shard(model.cross_attention, mp_policy=mp_policy, reshard_after_forward=True)
 
     # Root model
     fully_shard(model, mp_policy=mp_policy, reshard_after_forward=False)
@@ -197,6 +211,9 @@ def build_optimizer(
     config: TrainingConfig,
 ) -> torch.optim.AdamW:
     """Build AdamW optimizer with per-component learning rates."""
+    # Unwrap DDP if needed
+    raw_model = model.module if hasattr(model, "module") else model
+
     seen: set[int] = set()
     adapter_params: list[Tensor] = []
     diffusion_params: list[Tensor] = []
@@ -204,13 +221,13 @@ def build_optimizer(
 
     # Adapter params: cross-attention + input_proj + time embedder + output_head + adaln
     adapter_modules = [
-        model.cross_attention,
-        model.state_diffusion.input_proj,
-        model.state_diffusion.time_embedder,
-        model.state_diffusion.time_conditioner,
-        model.state_diffusion.adaln_layers,
-        model.state_diffusion.output_head,
-        model.state_diffusion.position_embedding,
+        raw_model.cross_attention,
+        raw_model.state_diffusion.input_proj,
+        raw_model.state_diffusion.time_embedder,
+        raw_model.state_diffusion.time_conditioner,
+        raw_model.state_diffusion.adaln_layers,
+        raw_model.state_diffusion.output_head,
+        raw_model.state_diffusion.position_embedding,
     ]
     for module in adapter_modules:
         if module is None:
@@ -222,9 +239,9 @@ def build_optimizer(
 
     # Diffusion backbone params: decoder layers + final norm + rotary
     diffusion_modules = [
-        model.state_diffusion.layers,
-        model.state_diffusion.final_norm,
-        model.state_diffusion.rotary_emb,
+        raw_model.state_diffusion.layers,
+        raw_model.state_diffusion.final_norm,
+        raw_model.state_diffusion.rotary_emb,
     ]
     for module in diffusion_modules:
         if module is None:
@@ -235,7 +252,7 @@ def build_optimizer(
                 seen.add(id(p))
 
     # VLM params: everything else
-    for p in model.vlm.parameters():
+    for p in raw_model.vlm.parameters():
         if p.requires_grad and id(p) not in seen:
             vlm_params.append(p)
             seen.add(id(p))
@@ -266,13 +283,21 @@ def build_scheduler(
     optimizer: torch.optim.Optimizer,
     config: TrainingConfig,
 ) -> torch.optim.lr_scheduler.LRScheduler:
-    """Cosine schedule with linear warmup."""
+    """Build LR scheduler: constant or cosine, both with linear warmup."""
 
-    def lr_lambda(step: int) -> float:
-        if step < config.warmup_steps:
-            return step / max(config.warmup_steps, 1)
-        progress = (step - config.warmup_steps) / max(config.max_steps - config.warmup_steps, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    if config.scheduler_type == "constant":
+        # Constant LR after warmup
+        def lr_lambda(step: int) -> float:
+            if step < config.warmup_steps:
+                return step / max(config.warmup_steps, 1)
+            return 1.0
+    else:
+        # Cosine decay after warmup
+        def lr_lambda(step: int) -> float:
+            if step < config.warmup_steps:
+                return step / max(config.warmup_steps, 1)
+            progress = (step - config.warmup_steps) / max(config.max_steps - config.warmup_steps, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -617,6 +642,35 @@ def run_training(config: TrainingConfig) -> None:
     # Metrics file
     metrics_path = output_dir / "train_metrics.jsonl" if ctx.is_main else None
 
+    # WandB
+    if ctx.is_main and config.wandb_enabled:
+        try:
+            import wandb
+
+            wandb.init(
+                project=config.wandb_project,
+                name=config.wandb_name or None,
+                config={
+                    "max_steps": config.max_steps,
+                    "batch_size": config.batch_size,
+                    "adapter_lr": config.adapter_lr,
+                    "diffusion_lr": config.diffusion_lr,
+                    "vlm_lr": config.vlm_lr,
+                    "trainable_mode": config.trainable_mode,
+                    "compute_dtype": config.compute_dtype,
+                },
+            )
+        except ImportError:
+            logger.warning("wandb not installed, disabling wandb logging")
+            config.wandb_enabled = False
+
+    # EMA
+    ema = None
+    if config.ema_enabled:
+        from .utils.ema import EMAManager
+
+        ema = EMAManager(model, decay=config.ema_decay, warmup_steps=config.ema_warmup_steps)
+
     # Training loop
     model.train()
     data_iter: Iterator = iter([])
@@ -649,6 +703,10 @@ def run_training(config: TrainingConfig) -> None:
         global_step += 1
         step_time = time.perf_counter() - step_start
 
+        # EMA update
+        if ema is not None:
+            ema.update()
+
         # Logging
         if ctx.is_main and global_step % config.log_every == 0:
             metrics["step"] = global_step
@@ -662,6 +720,10 @@ def run_training(config: TrainingConfig) -> None:
             if metrics_path:
                 with metrics_path.open("a") as f:
                     f.write(json.dumps(metrics) + "\n")
+            if config.wandb_enabled:
+                import wandb
+
+                wandb.log(metrics, step=global_step)
 
         # Checkpointing
         if global_step % config.save_every_steps == 0:
@@ -671,4 +733,8 @@ def run_training(config: TrainingConfig) -> None:
     save_checkpoint(model, optimizer, scheduler, global_step, output_dir, ctx=ctx)
     cleanup_distributed()
     if ctx.is_main:
+        if config.wandb_enabled:
+            import wandb
+
+            wandb.finish()
         logger.info(f"Training complete. Final step: {global_step}")
