@@ -31,10 +31,8 @@ vae:
   image_size: 256
 
 data:
-  # 线上用 prepared dataset (safetensors shards)，这里用 JSONL manifest 作为简化版本
-  # 如需对接 prepared dataset，设 dataset_type: wm_sequence_prepared
-  train_manifest: /share/project/eai_pwm/prepared_datasets/gpic_train_v1_94_incremental/train.jsonl
-  image_root: /share/project/eai_pwm/prepared_datasets/gpic_train_v1_94_incremental/images
+  dataset_type: wm_sequence_prepared
+  prepared_root: /share/project/eai_pwm/prepared_datasets/gpic_train_v1_94_incremental
   image_size: 256
   batch_size: 8
   num_workers: 4

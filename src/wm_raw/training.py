@@ -55,6 +55,8 @@ class TrainingConfig:
     batch_size: int = 1
     num_workers: int = 4
     seed: int = 42
+    dataset_type: str = "manifest"  # "manifest" | "wm_sequence_prepared"
+    prepared_root: str = ""
 
     # Optimizer
     adapter_lr: float = 1e-4
@@ -597,18 +599,29 @@ def run_training(config: TrainingConfig) -> None:
             logger.info(f"Resumed from step {global_step}")
 
     # Data
-    from .data import DiffusionCollator, ImageCaptionDataset, load_manifest
+    from .data import DiffusionCollator, ImageCaptionDataset, PreparedImageCaptionDataset, load_manifest
     from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(config.vlm_path, trust_remote_code=True)
-    records = load_manifest(
-        config.train_manifest,
-        image_root=config.image_root or None,
-        max_samples=config.max_samples,
-        seed=config.seed,
-        shuffle=True,
-    )
-    dataset = ImageCaptionDataset(records)
+
+    if config.dataset_type == "wm_sequence_prepared":
+        if not config.prepared_root:
+            raise ValueError("data.prepared_root is required for dataset_type=wm_sequence_prepared")
+        dataset = PreparedImageCaptionDataset(
+            config.prepared_root,
+            image_size=config.image_size,
+            center_crop=True,
+            max_samples=config.max_samples,
+        )
+    else:
+        records = load_manifest(
+            config.train_manifest,
+            image_root=config.image_root or None,
+            max_samples=config.max_samples,
+            seed=config.seed,
+            shuffle=True,
+        )
+        dataset = ImageCaptionDataset(records)
     sampler = DistributedSampler(
         dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True, seed=config.seed
     )

@@ -51,6 +51,8 @@ def main() -> None:
 
     # Data
     data_cfg = raw_config.get("data", {})
+    tc.dataset_type = data_cfg.get("dataset_type", "manifest")
+    tc.prepared_root = data_cfg.get("prepared_root", "")
     tc.train_manifest = data_cfg.get("train_manifest", "")
     tc.image_root = data_cfg.get("image_root", "")
     tc.image_size = int(data_cfg.get("image_size", 256))
