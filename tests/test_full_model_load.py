@@ -196,14 +196,16 @@ def test_forward_with_loaded_weights(model):
         torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1
     ).unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
-    # latent_height=16, latent_width=16, patch_size=2 → 64 tokens, dim=256
-    latent_h = config.latent.latent_height // config.latent.patch_size  # 8
-    latent_w = config.latent.latent_width // config.latent.patch_size  # 8
-    n_tokens = latent_h * latent_w  # 64
-    target_dim = config.latent.latent_channels * config.latent.patch_size ** 2  # 64 * 4 = 256
-    state_target = torch.randn(batch_size, n_tokens, target_dim, device=device, dtype=torch.bfloat16)
+    # latent_height=16, latent_width=16 → 256 tokens pre-patchify, channels=64
+    n_tokens = config.latent.latent_height * config.latent.latent_width  # 256
+    latent_channels = config.latent.latent_channels  # 64
+    state_target = torch.randn(
+        batch_size, n_tokens, latent_channels, device=device, dtype=torch.bfloat16
+    )
 
-    print(f"  Forward pass: batch={batch_size}, seq_len={seq_len}, latent_tokens={n_tokens}")
+    # After patchify: 64 tokens, dim=256
+    print(f"  Forward pass: batch={batch_size}, seq_len={seq_len}, "
+          f"latent_tokens={n_tokens} (pre-patch)")
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         with torch.no_grad():
