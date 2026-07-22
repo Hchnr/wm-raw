@@ -153,10 +153,10 @@ class WorldModel(nn.Module):
 
         # 4. Run diffusion backbone
         prediction = self.state_diffusion(
-            noisy_tokens=noisy_tokens,
+            noisy_latent=noisy_tokens,
             timesteps=timesteps,
-            vlm_hidden_states=vlm_hidden_states,
-            cross_attention=self.cross_attention,
+            cross_attention_contexts=vlm_hidden_states,
+            cross_attention_fn=self.cross_attention.condition_layer,
             cross_attention_mask=cross_attention_mask,
         )  # [B, num_tokens, token_dim]
 
@@ -164,6 +164,59 @@ class WorldModel(nn.Module):
         loss = flow_matching_loss(prediction, velocity_target, mask=loss_mask)
 
         return DiffusionOutput(loss=loss, prediction=prediction)
+
+    def forward_joint(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        position_ids: Tensor,
+        state_target: Tensor,
+        pixel_values: Optional[Tensor] = None,
+        image_grid_thw: Optional[Tensor] = None,
+        image_token_mask: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
+        timesteps: Optional[Tensor] = None,
+        noise: Optional[Tensor] = None,
+        loss_mask: Optional[Tensor] = None,
+        cross_attention_mask: Optional[Tensor] = None,
+    ) -> WorldModelOutput:
+        """Joint VLM + Diffusion forward (convenience API).
+
+        Runs VLM forward (with optional AR loss), then diffusion conditioned
+        on VLM hidden states. Returns combined weighted loss.
+        """
+        vlm_out = self.forward_vlm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            image_token_mask=image_token_mask,
+            labels=labels,
+        )
+
+        diff_out = self.forward_diffusion(
+            state_target=state_target,
+            vlm_hidden_states=vlm_out.hidden_states,
+            timesteps=timesteps,
+            noise=noise,
+            loss_mask=loss_mask,
+            cross_attention_mask=cross_attention_mask,
+        )
+
+        ar_loss = vlm_out.ar_loss
+        diff_loss = diff_out.loss
+        total_loss = torch.tensor(0.0, device=diff_loss.device)
+        if ar_loss is not None:
+            total_loss = total_loss + self.config.ar_loss_weight * ar_loss
+        total_loss = total_loss + self.config.state_diffusion_loss_weight * diff_loss
+
+        return WorldModelOutput(
+            loss=total_loss,
+            ar_loss=ar_loss,
+            diffusion_loss=diff_loss,
+            metadata={"task_type": "joint"},
+        )
 
     def forward(
         self,

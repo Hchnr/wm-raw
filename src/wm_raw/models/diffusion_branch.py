@@ -18,7 +18,7 @@ from torch import Tensor, nn
 
 from ..config import DiffusionConfig, LatentConfig
 from .adaln import AdaLNZero, SinusoidalTimestepEmbedding
-from .embeddings import ContinuousTokenProjector, Sincos2DPositionEmbedding, patchify_latent
+from .embeddings import ContinuousTokenProjector, Sincos2DPositionEmbedding
 from .qwen3vl_backbone import DecoderLayer, RMSNorm
 from .rope import TextMRoPE
 
@@ -183,33 +183,29 @@ class StateDiffusionBranch(nn.Module):
 
     def prepare_inputs(
         self,
-        noisy_latent: Tensor,  # [B, H*W, C] — noisy VAE latents (flat grid)
+        noisy_tokens: Tensor,  # [B, num_tokens, token_dim] — already patchified noisy tokens
         timesteps: Tensor,  # [B]
     ) -> tuple[Tensor, Tensor]:
-        """Tokenize noisy latents and apply timestep conditioning.
+        """Project noisy tokens and apply timestep conditioning.
+
+        Args:
+            noisy_tokens: [B, num_tokens, token_dim] already patchified
+            timesteps: [B] flow matching timesteps
 
         Returns:
             hidden: [B, num_tokens, D] — ready for decoder layers
             time_hidden: [B, D] — timestep embedding for AdaLN
         """
-        batch = noisy_latent.shape[0]
+        batch = noisy_tokens.shape[0]
 
-        # 1. Patchify: [B, H*W, C] → [B, num_tokens, token_dim]
-        tokens = patchify_latent(
-            noisy_latent,
-            height=self.latent_config.latent_height,
-            width=self.latent_config.latent_width,
-            patch_size=self.latent_config.patch_size,
-        )
+        # 1. Project to hidden dimension: [B, num_tokens, D]
+        hidden = self.input_proj(noisy_tokens)
 
-        # 2. Project to hidden dimension: [B, num_tokens, D]
-        hidden = self.input_proj(tokens)
-
-        # 3. Add position embedding
+        # 2. Add position embedding
         pos_embed = self.position_embedding(batch)  # [B, num_tokens, D]
         hidden = hidden + pos_embed
 
-        # 4. Timestep conditioning
+        # 3. Timestep conditioning
         time_hidden = self.time_embedder(timesteps)  # [B, D]
         # Add timestep to all token positions
         time_cond = self.time_conditioner(time_hidden)  # [B, D]
@@ -219,27 +215,27 @@ class StateDiffusionBranch(nn.Module):
 
     def forward(
         self,
-        noisy_latent: Tensor,  # [B, H*W, C]
+        noisy_latent: Tensor,  # [B, num_tokens, token_dim] — patchified noisy tokens
         timesteps: Tensor,  # [B]
-        cross_attention_contexts: list[Tensor] | None = None,  # per-layer [B, S_vlm, D_vlm]
+        cross_attention_contexts: list[Tensor] | None = None,  # VLM hidden states
         cross_attention_fn=None,  # CrossAttentionStack.condition_layer
         attention_mask: Optional[Tensor] = None,  # [B, 1, S, S]
         cross_attention_mask: Optional[Tensor] = None,  # [B, 1, S_diff, S_vlm]
     ) -> Tensor:
-        """Full diffusion forward: noisy latent → velocity prediction.
+        """Full diffusion forward: noisy tokens → velocity prediction.
 
         Args:
-            noisy_latent: [B, H*W, C] noisy (flow-interpolated) latent
+            noisy_latent: [B, num_tokens, token_dim] patchified noisy tokens
             timesteps: [B] timestep values in [0, 1]
-            cross_attention_contexts: VLM hidden states per diffusion layer
-            cross_attention_fn: callable to apply cross-attention
+            cross_attention_contexts: VLM hidden states (list, indexed by layer map)
+            cross_attention_fn: callable(layer_idx, hidden, contexts, mask) → hidden
             attention_mask: self-attention mask for diffusion tokens
             cross_attention_mask: mask for cross-attention to VLM
 
         Returns:
             prediction: [B, num_tokens, token_dim] — velocity prediction
         """
-        # Prepare inputs
+        # Prepare inputs (project + pos embed + timestep cond)
         hidden, time_hidden = self.prepare_inputs(noisy_latent, timesteps)
         batch, num_tokens, _ = hidden.shape
 
