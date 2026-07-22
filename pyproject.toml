@@ -10,12 +10,18 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.4.0",
     "safetensors>=0.4.0",
+    "pyyaml>=6.0",
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4.0",
+]
+train = [
+    "transformers>=4.43.0",
+    "diffusers>=0.30.0",
 ]
 
 [tool.hatch.build.targets.wheel]

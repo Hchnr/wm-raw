@@ -1,0 +1,60 @@
+# wm-raw: GPIC image-only diffusion training config
+# Usage: torchrun --nproc_per_node=8 -m wm_raw.train --config configs/gpic_image_diffusion.yaml
+
+model:
+  vlm_path: /share/project/eai_pwm/home/models/Qwen3-VL-4B-Instruct
+  diffusion_path: /share/project/eai_pwm/home/models/Qwen3-VL-2B-Instruct
+  torch_dtype: bfloat16
+
+vae:
+  model_path: /share/project/eai_pwm/home/models/BAGEL-7B-MoT/ae.safetensors
+  image_size: 256
+
+data:
+  train_manifest: /share/project/eai_pwm/home/data/gpic_image_caption_small/train.jsonl
+  image_root: /share/project/eai_pwm/home/data/gpic_image_caption_small/images
+  image_size: 256
+  batch_size: 1
+  num_workers: 4
+  seed: 42
+  condition_prefix: "Caption: "
+  condition_suffix: " <|wm_predict_image|>"
+  text_condition_dropout_prob: 0.0
+
+multitask:
+  vlm_microbatches_per_step: 0
+  diffusion_microbatches_per_step: 4
+  trainable_mode: diffusion
+  train_diffusion_backbone: true
+  vlm_loss_weight: 0.0
+  state_loss_weight: 1.0
+
+optimizer:
+  adapter_learning_rate: 1.0e-4
+  diffusion_learning_rate: 1.0e-5
+  vlm_learning_rate: 1.0e-6
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+
+scheduler:
+  type: cosine
+  warmup_steps: 200
+
+training:
+  max_steps: 10000
+  log_every: 10
+  output_dir: outputs/gpic_image_diffusion
+
+checkpoint:
+  save_every_steps: 1000
+  resume_from:
+
+distributed:
+  strategy: fsdp2
+
+logging:
+  wandb_enabled: false
+  wandb_project: wm-raw
+  wandb_name: gpic-image-diffusion
