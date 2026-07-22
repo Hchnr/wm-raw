@@ -11,38 +11,37 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class TextModelConfig:
-    """Qwen3-VL text decoder configuration (matches HF Qwen3VLTextConfig)."""
+    """Qwen3-VL text decoder configuration (matches HF Qwen3-VL-4B-Instruct)."""
 
     vocab_size: int = 151936
-    hidden_size: int = 3584
-    intermediate_size: int = 18944
+    hidden_size: int = 2560
+    intermediate_size: int = 9728
     num_hidden_layers: int = 36
-    num_attention_heads: int = 28
-    num_key_value_heads: int = 4
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
     head_dim: int = 128
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 500000.0
+    rope_theta: float = 5000000.0
     mrope_section: tuple[int, ...] = (24, 20, 20)
-    max_position_embeddings: int = 128000
+    max_position_embeddings: int = 262144
 
 
 @dataclass(frozen=True)
 class VisionModelConfig:
-    """Qwen3-VL vision encoder configuration."""
+    """Qwen3-VL vision encoder configuration (matches Qwen3-VL-4B-Instruct)."""
 
-    depth: int = 27
-    hidden_size: int = 1152
-    intermediate_size: int = 4304
+    depth: int = 24
+    hidden_size: int = 1024
+    intermediate_size: int = 4096
     num_heads: int = 16
-    head_dim: int = 72  # hidden_size // num_heads
+    head_dim: int = 64  # hidden_size // num_heads
     in_channels: int = 3
     patch_size: int = 16
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
-    out_hidden_size: int = 3584  # projects to text hidden_size
+    out_hidden_size: int = 2560  # projects to text hidden_size via merger
     rope_theta: float = 10000.0
     num_position_embeddings: int = 2304
-    deepstack_visual_indexes: tuple[int, ...] = (8, 16, 24)
 
 
 @dataclass(frozen=True)
@@ -75,17 +74,17 @@ class LatentConfig:
 
 @dataclass(frozen=True)
 class DiffusionConfig:
-    """State diffusion branch configuration."""
+    """State diffusion branch configuration (matches Qwen3-VL-2B-Instruct)."""
 
-    # Diffusion backbone — typically Qwen3-VL-2B
-    hidden_size: int = 1536
-    intermediate_size: int = 8960
+    # Diffusion backbone — Qwen3-VL-2B
+    hidden_size: int = 2048
+    intermediate_size: int = 6144
     num_hidden_layers: int = 28
-    num_attention_heads: int = 12
-    num_key_value_heads: int = 2
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 8
     head_dim: int = 128
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 500000.0
+    rope_theta: float = 5000000.0
     mrope_section: tuple[int, ...] = (24, 20, 20)
 
     # Diffusion objective
