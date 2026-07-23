@@ -542,9 +542,9 @@ def load_vae(
 
     # Try importing the BAGEL autoencoder
     try:
-        from wm_training.models.bagel.autoencoder import load_ae
+        from wm_training.models.bagel.autoencoder import load_bagel_autoencoder
 
-        ae = load_ae(str(vae_path))
+        ae, _params = load_bagel_autoencoder(str(vae_path))
         ae = ae.to(device=device, dtype=dtype)
         ae.eval()
         return ae

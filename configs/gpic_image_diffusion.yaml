@@ -6,7 +6,9 @@
 
 model:
   vlm_path: /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct
+  # vlm_path: /root/local_models/Qwen3-VL-4B-Instruct  # 本地缓存（拷贝后取消注释，加速加载）
   diffusion_path: /share/project/eai_pwm/models/Qwen3-VL-2B-Instruct
+  # diffusion_path: /root/local_models/Qwen3-VL-2B-Instruct  # 本地缓存
   torch_dtype: bfloat16
   # Cross-attention and layer mapping (matches online experiment)
   communication_policy: cross_kv_concat
@@ -27,6 +29,7 @@ model:
 
 vae:
   model_path: /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors
+  # model_path: /root/local_models/BAGEL-7B-MoT/ae.safetensors  # 本地缓存
   frozen: true
   image_size: 256
 

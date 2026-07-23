@@ -129,7 +129,17 @@ class DistContext:
 
 
 def setup_distributed() -> DistContext:
-    """Initialize distributed process group and return context."""
+    """Initialize distributed process group and return context.
+
+    If torchrun env vars aren't set, falls back to single-GPU mode.
+    """
+    if "RANK" not in os.environ:
+        # Single-GPU fallback (no torchrun)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device)
+        return DistContext(rank=0, world_size=1, local_rank=0, device=device)
+
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -414,12 +424,27 @@ def train_step(
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
 
+    # Build causal attention mask [B, 1, S, S]
+    # Start from padding mask [B, S] (1 = attend, 0 = ignore)
+    padding_mask = condition.get("attention_mask")
+    causal_mask = torch.triu(
+        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=compute_dtype),
+        diagonal=1,
+    )  # [S, S] upper-triangular = -inf
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)  # [B, 1, S, S]
+    if padding_mask is not None and not padding_mask.all():
+        # Mask out padded positions in the key dimension
+        # Use where() to avoid -inf * 0 = nan
+        pad_expanded = padding_mask.bool().unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+        causal_mask = causal_mask.clone()
+        causal_mask.masked_fill_(~pad_expanded, float("-inf"))
+
     # Forward with autocast
     with torch.amp.autocast("cuda", dtype=compute_dtype):
         # VLM forward (condition pass, no AR loss for diffusion-only)
         vlm_output = model.forward_vlm(
             input_ids=condition["input_ids"],
-            attention_mask=condition.get("attention_mask"),
+            attention_mask=causal_mask,
             position_ids=position_ids,
         )
 
@@ -467,7 +492,8 @@ def save_checkpoint(
     checkpoint_dir = output_dir / "checkpoints" / f"step-{step:06d}"
     if ctx.is_main:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
 
     # For FSDP2, use distributed checkpoint
     try:
