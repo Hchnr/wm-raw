@@ -84,7 +84,7 @@ checkpoint:
   save_every_steps: 5000
   keep_last_n: 4
   save_final: true
-  resume_from:
+  resume_from: /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_shift2_200k_fsdp_0721/checkpoints/step_105000.dcp
 
 distributed:
   strategy: fsdp2

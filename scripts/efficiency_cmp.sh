@@ -4,6 +4,7 @@
 # Requires 6 GPUs total (GPU 0-1, 2-3, 4-5)
 #
 # Usage: bash scripts/efficiency_cmp.sh
+# Kill all: pkill -f "wm_raw.train.*--wandb-name new_repo_exp"
 
 set -euo pipefail
 
@@ -57,10 +58,6 @@ CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=$NPROC --master_port=29502 -m
     --wandb-name new_repo_exp3-compile-fused \
     > logs/exp3_compile_fused.log 2>&1 &
 PID3=$!
-
-# Exp4: (reserved)
-# CUDAGraph (reduce-overhead) is incompatible with FSDP2 — causes per-step
-# re-capture (~7s/step). Dropped in favor of compile(default) + fused optimizer.
 
 echo ""
 echo "All experiments launched:"

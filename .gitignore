@@ -54,3 +54,6 @@ Thumbs.db
 
 # MyPy
 .mypy_cache/
+
+# Claude Code
+.claude/
