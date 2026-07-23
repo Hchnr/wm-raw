@@ -92,6 +92,7 @@ class TrainingConfig:
     log_every: int = 10
     wandb_enabled: bool = False
     wandb_project: str = "wm-raw"
+    wandb_entity: str = ""
     wandb_name: str = ""
 
     # Condition text
@@ -691,6 +692,7 @@ def run_training(config: TrainingConfig) -> None:
 
             wandb.init(
                 project=config.wandb_project,
+                entity=config.wandb_entity or None,
                 name=config.wandb_name or None,
                 config={
                     "max_steps": config.max_steps,

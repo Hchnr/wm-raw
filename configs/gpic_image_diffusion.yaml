@@ -85,4 +85,5 @@ distributed:
 logging:
   wandb_enabled: true
   wandb_project: wm-raw
+  wandb_entity: hechenrui123-beijing-academy-of-artificial-intelligence
   wandb_name: gpic-patchlatent-adaln-fm-shift2-200k

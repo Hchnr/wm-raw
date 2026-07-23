@@ -111,6 +111,7 @@ def main() -> None:
     log_cfg = raw_config.get("logging", {})
     tc.wandb_enabled = bool(log_cfg.get("wandb_enabled", False))
     tc.wandb_project = log_cfg.get("wandb_project", "wm-raw")
+    tc.wandb_entity = log_cfg.get("wandb_entity", "")
     tc.wandb_name = log_cfg.get("wandb_name", "")
 
     # EMA
