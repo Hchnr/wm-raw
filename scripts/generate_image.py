@@ -75,6 +75,110 @@ def load_own_dcp_checkpoint(model: WorldModel, dcp_path: Path) -> None:
     logger.info("Loaded own DCP checkpoint: %s (keys=%d)", dcp_path, len(state_dict["model"]))
 
 
+def load_online_dcp_for_inference(
+    model: WorldModel,
+    dcp_path: Path,
+    vlm_path: str,
+    *,
+    dtype: torch.dtype | None = None,
+) -> None:
+    """Load an online (wm-training) DCP checkpoint for inference.
+
+    Strategy:
+    - VLM branch: loaded from pretrained Qwen3-VL weights (fast, ~8B from safetensors)
+    - Diffusion + cross-attention: loaded from EMA state in the DCP (5 GB, much faster
+      than loading the full 22 GB model state + 74 GB total checkpoint)
+
+    This avoids the slow full-DCP single-process load.
+    """
+    import functools
+    import operator
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    # 1. Load VLM from pretrained weights (fast path)
+    logger.info("Loading VLM weights from %s ...", vlm_path)
+    from wm_raw.checkpoint import load_vlm_weights
+    vlm_report = load_vlm_weights(model, vlm_path)
+    logger.info("VLM: %s", vlm_report.format())
+
+    # 2. Load EMA (diffusion + cross_attention) from DCP
+    logger.info("Loading EMA weights from DCP (diffusion + cross_attention)...")
+    reader = FileSystemReader(str(dcp_path))
+    metadata = reader.read_metadata()
+    all_keys = list(metadata.state_dict_metadata.keys())
+
+    # Select EMA keys for state_diffusion_branch and cross_attention only
+    ema_keys = [
+        k for k in all_keys
+        if k.startswith("ema.") and "action_diffusion_branch" not in k
+    ]
+    logger.info("  EMA keys to load: %d", len(ema_keys))
+
+    # Build placeholder state dict
+    state_dict: dict[str, Tensor] = {}
+    for key in ema_keys:
+        md = metadata.state_dict_metadata[key]
+        if isinstance(md, TensorStorageMetadata):
+            state_dict[key] = torch.empty(md.size, dtype=md.properties.dtype)
+
+    dcp.load(state_dict, checkpoint_id=str(dcp_path))
+    logger.info("  DCP load complete, remapping keys...")
+
+    # 3. Remap EMA keys to model keys
+    # EMA key format: ema.{cross_attention|state_diffusion_branch}.adapters.state.X.Y
+    # We need to map to: {cross_attention|state_diffusion_branch}.X.Y
+    # But first, the online format uses different naming than our model.
+    # Let's use the existing _map_online_key with "model." prefix substitution.
+    from wm_raw.checkpoint import _map_online_key
+
+    remapped: dict[str, Tensor] = {}
+    for key, tensor in state_dict.items():
+        # Convert ema.X... to model.X... for the key mapper
+        # EMA stores: ema.cross_attention.adapters.state.0.context_norm.weight
+        #             ema.state_diffusion_branch.adaln_modulations.state.0.modulation.1.weight
+        #             ema.state_diffusion_branch.backbone.layers.state.0.self_attn.q_proj.weight
+        model_key = key.replace("ema.", "model.", 1)
+
+        # The _map_online_key prefix map already handles cross_attention ".state." removal.
+        # For diffusion branch, the online model doesn't have ".state." in its model keys,
+        # but EMA tracking inserts it for ModuleList. Remove it for diffusion sub-modules.
+        if "state_diffusion_branch" in model_key:
+            model_key = model_key.replace(".adaln_modulations.state.", ".adaln_modulations.", 1)
+            model_key = model_key.replace(".layers.state.", ".layers.", 1)
+
+        mapped = _map_online_key(model_key)
+        if mapped is None:
+            continue
+        # Strip 'model.' prefix
+        if mapped.startswith("model."):
+            mapped = mapped[len("model."):]
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        remapped[mapped] = tensor
+
+    # Load into model (non-strict, VLM already loaded)
+    model_sd = model.state_dict()
+    to_load: dict[str, Tensor] = {}
+    skipped = []
+    for key, tensor in remapped.items():
+        if key not in model_sd:
+            skipped.append(key)
+            continue
+        if tensor.shape != model_sd[key].shape:
+            skipped.append(f"{key} (shape mismatch)")
+            continue
+        to_load[key] = tensor
+
+    model.load_state_dict(to_load, strict=False)
+    logger.info("  Loaded %d EMA params into model (skipped %d)", len(to_load), len(skipped))
+    if skipped[:5]:
+        for s in skipped[:5]:
+            logger.debug("    skipped: %s", s)
+
+
 # ---------------------------------------------------------------------------
 # Flow-matching sampling utilities
 # ---------------------------------------------------------------------------
@@ -172,8 +276,8 @@ def predict_velocity(
         return model.state_diffusion(
             noisy_latent=noisy_tokens,
             timesteps=timesteps,
-            cross_attention_contexts=vlm_hidden_states,
-            cross_attention_fn=model.cross_attention.condition_layer,
+            cross_attention_stack=model.cross_attention,
+            vlm_hidden_states=vlm_hidden_states,
             cross_attention_mask=cross_attention_mask,
         )
 
@@ -377,20 +481,19 @@ def main():
     ckpt_path = Path(args.checkpoint)
     logger.info("Loading checkpoint: %s", ckpt_path)
     if ckpt_path.is_dir():
-        # DCP directory — check if it's our own format (has 'model.' prefix)
-        # or online format (has different key mapping)
+        # DCP directory — check if it's our own format or online format.
+        # Online checkpoint uses 'model.vlm_branch.*', ours uses 'model.vlm.*'.
         from torch.distributed.checkpoint.filesystem import FileSystemReader
         reader = FileSystemReader(str(ckpt_path))
         metadata = reader.read_metadata()
-        first_key = next(iter(metadata.state_dict_metadata.keys()), "")
-        if first_key.startswith("model."):
+        ckpt_keys = set(metadata.state_dict_metadata.keys())
+        is_online = any(k.startswith("model.vlm_branch.") for k in ckpt_keys)
+        if not is_online:
             # Our own FSDP DCP checkpoint
             load_own_dcp_checkpoint(model, ckpt_path)
         else:
-            # Online format DCP — use key remapping loader
-            from wm_raw.checkpoint import load_online_dcp_weights
-            report = load_online_dcp_weights(model, ckpt_path)
-            logger.info("Online DCP checkpoint: %s", report.format())
+            # Online format DCP — fast path: VLM from pretrained + EMA from DCP
+            load_online_dcp_for_inference(model, ckpt_path, args.vlm_path, dtype=dtype)
     else:
         load_checkpoint(ckpt_path, model)
     model = model.to(device=device, dtype=dtype)

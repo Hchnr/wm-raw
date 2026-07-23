@@ -37,7 +37,7 @@ data:
   dataset_type: wm_sequence_prepared
   prepared_root: /share/project/eai_pwm/prepared_datasets/gpic_train_v1_94_incremental
   image_size: 256
-  batch_size: 8
+  batch_size: 32
   num_workers: 4
   seed: 42
   condition_prefix: "Caption: "
