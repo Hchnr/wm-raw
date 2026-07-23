@@ -27,6 +27,20 @@ def parse_args() -> argparse.Namespace:
                         help="Override max_steps from config")
     parser.add_argument("--adam-fused", type=str, default=None, choices=["true", "false"],
                         help="Enable/disable fused AdamW (overrides config)")
+    # Output / logging overrides
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override training output directory")
+    parser.add_argument("--compile", type=str, default=None, choices=["true", "false"],
+                        help="Enable/disable torch.compile (overrides config)")
+    parser.add_argument("--compile-mode", type=str, default=None,
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode (overrides config)")
+    parser.add_argument("--wandb-project", type=str, default=None,
+                        help="Override wandb project name")
+    parser.add_argument("--wandb-name", type=str, default=None,
+                        help="Override wandb run name")
+    parser.add_argument("--log-dir", type=str, default=None,
+                        help="Override log file directory (default: <output_dir>/logs)")
     return parser.parse_args()
 
 
@@ -144,6 +158,18 @@ def main() -> None:
         tc.max_steps = args.max_steps
     if args.adam_fused is not None:
         tc.adam_fused = args.adam_fused.lower() == "true"
+    if args.output_dir is not None:
+        tc.output_dir = args.output_dir
+    if args.compile is not None:
+        tc.compile_enabled = args.compile.lower() == "true"
+    if args.compile_mode is not None:
+        tc.compile_mode = args.compile_mode
+    if args.wandb_project is not None:
+        tc.wandb_project = args.wandb_project
+    if args.wandb_name is not None:
+        tc.wandb_name = args.wandb_name
+    if args.log_dir is not None:
+        tc.log_dir = args.log_dir
 
     run_training(tc)
 
