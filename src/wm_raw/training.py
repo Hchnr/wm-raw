@@ -65,6 +65,7 @@ class TrainingConfig:
     weight_decay: float = 0.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
+    adam_fused: bool = True
     max_grad_norm: float = 1.0
 
     # Schedule
@@ -250,7 +251,7 @@ def build_optimizer(
         raw_model.state_diffusion.time_conditioner,
         raw_model.state_diffusion.adaln_layers,
         raw_model.state_diffusion.output_head,
-        raw_model.state_diffusion.position_embedding,
+        raw_model.state_diffusion.latent_position_embedding,
     ]
     for module in adapter_modules:
         if module is None:
@@ -299,7 +300,7 @@ def build_optimizer(
         groups,
         betas=(config.adam_beta1, config.adam_beta2),
         weight_decay=config.weight_decay,
-        fused=True,
+        fused=config.adam_fused,
     )
 
 
@@ -348,7 +349,7 @@ def configure_trainable(model: WorldModel, config: TrainingConfig) -> None:
             model.state_diffusion.time_conditioner,
             model.state_diffusion.adaln_layers,
             model.state_diffusion.output_head,
-            model.state_diffusion.position_embedding,
+            model.state_diffusion.latent_position_embedding,
         ]:
             if module is not None:
                 for p in module.parameters():
@@ -566,12 +567,20 @@ def load_checkpoint(
     - DCP (distributed checkpoint) with automatic resharding across different
       world sizes (e.g. saved on 8 GPUs, resumed on 2 GPUs).
     - Single-file checkpoint fallback for non-FSDP runs.
+
+    In both paths, validates structure alignment between the checkpoint and the
+    current model. Logs ERROR for any missing, unexpected, or shape-mismatched
+    keys before proceeding with the loadable subset.
     """
+    from .checkpoint import CheckpointReport
+
     path = Path(path)
 
     # Try DCP first (FSDP2 distributed checkpoint)
     if (path / ".metadata").exists():
         import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import FileSystemReader
+        from torch.distributed.checkpoint.metadata import TensorStorageMetadata
         from torch.distributed.checkpoint.state_dict import (
             get_model_state_dict,
             get_optimizer_state_dict,
@@ -580,6 +589,48 @@ def load_checkpoint(
             StateDictOptions,
         )
 
+        # --- Structure validation: compare DCP metadata keys vs model keys ---
+        reader = FileSystemReader(str(path))
+        metadata = reader.read_metadata()
+        ckpt_model_keys = set()
+        ckpt_model_shapes: dict[str, tuple] = {}
+        for k, md in metadata.state_dict_metadata.items():
+            if k.startswith("model."):
+                stripped = k[len("model."):]
+                ckpt_model_keys.add(stripped)
+                if isinstance(md, TensorStorageMetadata):
+                    ckpt_model_shapes[stripped] = tuple(md.size)
+
+        model_sd = model.state_dict()
+        model_keys = set(model_sd.keys())
+
+        missing_keys = sorted(model_keys - ckpt_model_keys)
+        unexpected_keys = sorted(ckpt_model_keys - model_keys)
+        shape_mismatch: list[str] = []
+        matched_count = 0
+
+        for key in sorted(model_keys & ckpt_model_keys):
+            if key in ckpt_model_shapes:
+                model_shape = tuple(model_sd[key].shape)
+                if model_shape != ckpt_model_shapes[key]:
+                    shape_mismatch.append(
+                        f"{key}: model={list(model_shape)} vs ckpt={list(ckpt_model_shapes[key])}"
+                    )
+                else:
+                    matched_count += 1
+            else:
+                matched_count += 1  # non-tensor metadata, assume ok
+
+        report = CheckpointReport(
+            matched=matched_count,
+            missing=tuple(missing_keys),
+            unexpected=tuple(unexpected_keys),
+            shape_mismatch=tuple(shape_mismatch),
+        )
+        logger.info(f"DCP checkpoint structure check: {report.format()}")
+        report.log_errors(context="load_checkpoint (DCP)")
+
+        # --- Proceed with DCP loading ---
         options = StateDictOptions(full_state_dict=False, cpu_offload=True)
 
         # Build target state dicts that DCP can reshard into.
@@ -614,7 +665,39 @@ def load_checkpoint(
     # Fallback: single file (non-FSDP)
     ckpt_file = path / "checkpoint.pt" if path.is_dir() else path
     state = torch.load(str(ckpt_file), map_location="cpu", weights_only=False)
-    model.load_state_dict(state["model"], strict=False)
+
+    # --- Structure validation for single-file checkpoint ---
+    ckpt_sd = state.get("model", {})
+    model_sd = model.state_dict()
+    model_keys = set(model_sd.keys())
+    ckpt_keys = set(ckpt_sd.keys())
+
+    missing_keys_sf = sorted(model_keys - ckpt_keys)
+    unexpected_keys_sf = sorted(ckpt_keys - model_keys)
+    shape_mismatch_sf: list[str] = []
+    matched_keys_sf: list[str] = []
+
+    for key in sorted(model_keys & ckpt_keys):
+        if model_sd[key].shape != ckpt_sd[key].shape:
+            shape_mismatch_sf.append(
+                f"{key}: model={list(model_sd[key].shape)} vs ckpt={list(ckpt_sd[key].shape)}"
+            )
+        else:
+            matched_keys_sf.append(key)
+
+    report = CheckpointReport(
+        matched=len(matched_keys_sf),
+        missing=tuple(missing_keys_sf),
+        unexpected=tuple(unexpected_keys_sf),
+        shape_mismatch=tuple(shape_mismatch_sf),
+    )
+    logger.info(f"Single-file checkpoint structure check: {report.format()}")
+    report.log_errors(context="load_checkpoint (single-file)")
+
+    # Load only matched keys
+    load_dict = {k: ckpt_sd[k] for k in matched_keys_sf}
+    model.load_state_dict(load_dict, strict=False)
+
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and "scheduler" in state:

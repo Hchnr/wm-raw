@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
                         help="Skip pretrained weight loading (test pipeline with random weights)")
     parser.add_argument("--max-steps", type=int, default=None,
                         help="Override max_steps from config")
+    parser.add_argument("--adam-fused", type=str, default=None, choices=["true", "false"],
+                        help="Enable/disable fused AdamW (overrides config)")
     return parser.parse_args()
 
 
@@ -76,6 +78,7 @@ def main() -> None:
     tc.weight_decay = float(opt_cfg.get("weight_decay", 0.0))
     tc.adam_beta1 = float(opt_cfg.get("adam_beta1", 0.9))
     tc.adam_beta2 = float(opt_cfg.get("adam_beta2", 0.95))
+    tc.adam_fused = bool(opt_cfg.get("adam_fused", True))
     tc.max_grad_norm = float(opt_cfg.get("max_grad_norm", 1.0))
 
     # Scheduler
@@ -139,6 +142,8 @@ def main() -> None:
         tc.skip_pretrained = True
     if args.max_steps is not None:
         tc.max_steps = args.max_steps
+    if args.adam_fused is not None:
+        tc.adam_fused = args.adam_fused.lower() == "true"
 
     run_training(tc)
 

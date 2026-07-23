@@ -18,7 +18,7 @@ from torch import Tensor, nn
 
 from ..config import DiffusionConfig, LatentConfig
 from .adaln import AdaLNZero, SinusoidalTimestepEmbedding
-from .embeddings import ContinuousTokenProjector, Sincos2DPositionEmbedding
+from .embeddings import BagelGridPositionEmbedding, ContinuousTokenProjector
 from .qwen3vl_backbone import DecoderLayer, RMSNorm
 from .rope import TextMRoPE
 
@@ -147,12 +147,13 @@ class StateDiffusionBranch(nn.Module):
         # Timestep → hidden additive conditioning
         self.time_conditioner = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
-        # Position embedding for latent grid
-        self.position_embedding = Sincos2DPositionEmbedding(
-            grid_h=patch_h,
-            grid_w=patch_w,
-            embed_dim=config.hidden_size,
+        # Position embedding for latent grid (BAGEL-style frozen 2D sincos table)
+        self.latent_position_embedding = BagelGridPositionEmbedding(
+            max_num_patch_per_side=latent_config.max_position_size,
+            hidden_size=config.hidden_size,
         )
+        self._patch_h = patch_h
+        self._patch_w = patch_w
 
         # Decoder layers
         self.layers = nn.ModuleList([
@@ -205,9 +206,12 @@ class StateDiffusionBranch(nn.Module):
         # 1. Project to hidden dimension: [B, num_tokens, D]
         hidden = self.input_proj(noisy_tokens)
 
-        # 2. Add position embedding
-        pos_embed = self.position_embedding(batch)  # [B, num_tokens, D]
-        hidden = hidden + pos_embed
+        # 2. Add position embedding (BAGEL-style indexing)
+        pos_ids = self.latent_position_embedding.make_position_ids(
+            self._patch_h, self._patch_w, batch
+        ).to(hidden.device)
+        pos_embed = self.latent_position_embedding(pos_ids)  # [B, num_tokens, D]
+        hidden = hidden + pos_embed.to(hidden.dtype)
 
         # 3. Timestep conditioning
         time_hidden = self.time_embedder(timesteps)  # [B, D]
