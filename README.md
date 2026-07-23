@@ -52,11 +52,66 @@ python -m wm_raw.train --config configs/gpic_image_diffusion.yaml
 ### 多卡训练（FSDP2）
 
 ```bash
-# 2 卡
+# 单机 2 卡
 torchrun --nproc_per_node=2 -m wm_raw.train --config configs/gpic_image_diffusion.yaml
 
-# 8 卡
+# 单机 8 卡
 torchrun --nproc_per_node=8 -m wm_raw.train --config configs/gpic_image_diffusion.yaml
+```
+
+### 多机多卡训练
+
+使用 `torchrun` 的多节点模式，每台机器上分别执行：
+
+```bash
+# 假设 2 台机器，每台 8 卡（共 16 卡）
+# 在每台机器上执行相同命令，torchrun 自动处理 RANK 分配
+
+# 方式一：指定 master 地址（推荐）
+torchrun \
+  --nnodes=2 \
+  --nproc_per_node=8 \
+  --node_rank=$NODE_RANK \
+  --master_addr=$MASTER_ADDR \
+  --master_port=29500 \
+  -m wm_raw.train --config configs/gpic_image_diffusion.yaml
+
+# 方式二：使用 rdzv（弹性，适合集群调度器如 SLURM）
+torchrun \
+  --nnodes=2 \
+  --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=$MASTER_ADDR:29500 \
+  -m wm_raw.train --config configs/gpic_image_diffusion.yaml
+```
+
+环境变量说明：
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `MASTER_ADDR` | 主节点 IP | `10.0.0.1` |
+| `MASTER_PORT` | 通信端口 | `29500` |
+| `NODE_RANK` | 当前节点编号（从 0 开始） | `0` / `1` |
+
+SLURM 示例：
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=wm-raw
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=64
+
+export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n1)
+export MASTER_PORT=29500
+
+srun torchrun \
+  --nnodes=$SLURM_NNODES \
+  --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+  -m wm_raw.train --config configs/gpic_image_diffusion.yaml
 ```
 
 ### 从 checkpoint 恢复
