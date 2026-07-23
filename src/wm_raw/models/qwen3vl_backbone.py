@@ -107,9 +107,12 @@ class TextAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Prepend external K/V for cross_kv_down
+        # Prepend external K/V for cross_kv_concat
         if external_kv is not None:
             ext_k, ext_v = external_kv  # [B, Hkv, K, D]
+            # Apply k_norm to external K (matches online: k_norm normalizes both
+            # native and external keys before they share one softmax)
+            ext_k = self.k_norm(ext_k)
             k = torch.cat([ext_k, k], dim=2)  # [B, Hkv, K+S, D]
             v = torch.cat([ext_v, v], dim=2)  # [B, Hkv, K+S, D]
 

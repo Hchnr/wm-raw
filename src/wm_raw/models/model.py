@@ -151,12 +151,12 @@ class WorldModel(nn.Module):
         noisy_tokens = add_flow_noise(clean_tokens, noise, timesteps)
         velocity_target = flow_matching_target(clean_tokens, noise)
 
-        # 4. Run diffusion backbone
+        # 4. Run diffusion backbone (cross_kv_concat: VLM K/V concat to self-attn)
         prediction = self.state_diffusion(
             noisy_latent=noisy_tokens,
             timesteps=timesteps,
-            cross_attention_contexts=vlm_hidden_states,
-            cross_attention_fn=self.cross_attention.condition_layer,
+            cross_attention_stack=self.cross_attention,
+            vlm_hidden_states=vlm_hidden_states,
             cross_attention_mask=cross_attention_mask,
         )  # [B, num_tokens, token_dim]
 

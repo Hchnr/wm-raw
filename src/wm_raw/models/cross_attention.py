@@ -123,18 +123,31 @@ class CrossAttentionAdapter(nn.Module):
     def project_context_kv(
         self,
         context_hidden: Tensor,  # [B, S_vlm, D_vlm]
+        *,
+        target_device: torch.device | None = None,
+        target_dtype: torch.dtype | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Pre-project context K/V for cross_kv_concat mode.
+
+        Projects VLM hidden states into K, V that will be concatenated
+        to the diffusion self-attention K/V inside each decoder layer.
 
         Returns:
             k: [B, H_kv, S_vlm, D]
             v: [B, H_kv, S_vlm, D]
         """
+        if target_device is not None or target_dtype is not None:
+            context_hidden = context_hidden.to(
+                device=target_device or context_hidden.device,
+                dtype=target_dtype or context_hidden.dtype,
+            )
         kv_input = self.context_norm(context_hidden)
-        batch, seq_vlm, _ = context_hidden.shape
+        batch, seq_vlm, _ = kv_input.shape
 
-        k = self.k_proj(kv_input).view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(kv_input).view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(kv_input.to(self.k_proj.weight.dtype))
+        v = self.v_proj(kv_input.to(self.v_proj.weight.dtype))
+        k = k.view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
         return k, v
 
 
@@ -210,6 +223,38 @@ class CrossAttentionStack(nn.Module):
             for _ in range(num_diffusion_layers)
         ])
 
+    def project_context_kv(
+        self,
+        diffusion_layer_idx: int,
+        vlm_hidden_states: Sequence[Tensor],
+        *,
+        target_device: torch.device | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Project VLM context into K/V for cross_kv_concat at a given layer.
+
+        Selects the VLM hidden state via layer_map + offset, then projects
+        through the adapter's context_norm → k_proj / v_proj.
+
+        Args:
+            diffusion_layer_idx: index of the current diffusion layer
+            vlm_hidden_states: all VLM hidden states (length = num_vlm_layers + 1)
+            target_device: optional device to move context to before projection
+            target_dtype: optional dtype to cast context to before projection
+
+        Returns:
+            k: [B, H_kv, S_vlm, D]
+            v: [B, H_kv, S_vlm, D]
+        """
+        vlm_layer_idx = self.layer_map[diffusion_layer_idx]
+        state_index = vlm_layer_idx + self.hidden_state_layer_offset
+        context = vlm_hidden_states[state_index]
+
+        adapter = self.adapters[diffusion_layer_idx]
+        return adapter.project_context_kv(
+            context, target_device=target_device, target_dtype=target_dtype
+        )
+
     def condition_layer(
         self,
         diffusion_layer_idx: int,
@@ -217,7 +262,10 @@ class CrossAttentionStack(nn.Module):
         vlm_hidden_states: Sequence[Tensor],  # list of [B, S_vlm, D_vlm]
         attention_mask: Tensor | None = None,
     ) -> Tensor:
-        """Apply cross-attention for one diffusion layer.
+        """Apply cross-attention for one diffusion layer (legacy separate cross-attn).
+
+        NOTE: This is NOT the cross_kv_concat path. Use project_context_kv instead
+        for the correct behavior matching the online model.
 
         Selects the appropriate VLM hidden state based on layer_map + offset,
         then runs the cross-attention adapter.

@@ -11,7 +11,7 @@ Uses flow matching: predicts velocity v = noise - clean.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -225,20 +225,23 @@ class StateDiffusionBranch(nn.Module):
         self,
         noisy_latent: Tensor,  # [B, num_tokens, token_dim] — patchified noisy tokens
         timesteps: Tensor,  # [B]
-        cross_attention_contexts: list[Tensor] | None = None,  # VLM hidden states
-        cross_attention_fn=None,  # CrossAttentionStack.condition_layer
-        attention_mask: Optional[Tensor] = None,  # [B, 1, S, S]
-        cross_attention_mask: Optional[Tensor] = None,  # [B, 1, S_diff, S_vlm]
+        cross_attention_stack=None,  # CrossAttentionStack instance
+        vlm_hidden_states: Sequence[Tensor] | None = None,  # VLM hidden states
+        attention_mask: Optional[Tensor] = None,  # [B, 1, S, S+K] or None
+        cross_attention_mask: Optional[Tensor] = None,  # [B, S_vlm] bool mask or None
     ) -> Tensor:
         """Full diffusion forward: noisy tokens → velocity prediction.
+
+        Uses cross_kv_concat: VLM context K/V are projected and concatenated
+        to self-attention K/V inside each decoder layer.
 
         Args:
             noisy_latent: [B, num_tokens, token_dim] patchified noisy tokens
             timesteps: [B] timestep values in [0, 1]
-            cross_attention_contexts: VLM hidden states (list, indexed by layer map)
-            cross_attention_fn: callable(layer_idx, hidden, contexts, mask) → hidden
-            attention_mask: self-attention mask for diffusion tokens
-            cross_attention_mask: mask for cross-attention to VLM
+            cross_attention_stack: CrossAttentionStack for projecting VLM context
+            vlm_hidden_states: VLM hidden states (list, indexed by layer map)
+            attention_mask: combined self+cross attention mask [B, 1, S, K+S]
+            cross_attention_mask: [B, S_vlm] bool mask for VLM tokens (unused for now)
 
         Returns:
             prediction: [B, num_tokens, token_dim] — velocity prediction
@@ -256,22 +259,32 @@ class StateDiffusionBranch(nn.Module):
         position_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
         cos, sin = self.rotary_emb(position_ids)
 
+        # Build combined attention mask for cross_kv_concat
+        # Mask shape: [B, 1, S_query, S_external + S_self]
+        # External (VLM context) tokens are all visible; self-attention is bidirectional
+        combined_mask = attention_mask  # will be None for no masking (all-to-all)
+
         # Run decoder layers
         for layer_idx, (layer, adaln) in enumerate(zip(self.layers, self.adaln_layers)):
             # Compute AdaLN params from timestep
             adaln_params = adaln(time_hidden)
 
-            # Apply cross-attention if available
-            if cross_attention_fn is not None and cross_attention_contexts is not None:
-                hidden = cross_attention_fn(
-                    layer_idx, hidden, cross_attention_contexts, cross_attention_mask
+            # Project VLM context into K/V for this layer (cross_kv_concat)
+            external_kv = None
+            if cross_attention_stack is not None and vlm_hidden_states is not None:
+                external_kv = cross_attention_stack.project_context_kv(
+                    layer_idx,
+                    vlm_hidden_states,
+                    target_device=hidden.device,
+                    target_dtype=hidden.dtype,
                 )
 
-            # Decoder layer with AdaLN modulation
+            # Decoder layer with AdaLN modulation + external KV
             hidden = layer(
                 hidden,
-                attention_mask=attention_mask,
+                attention_mask=combined_mask,
                 position_embeddings=(cos, sin),
+                external_kv=external_kv,
                 adaln_params=adaln_params,
             )
 
