@@ -97,6 +97,7 @@ class TrainingConfig:
 
     # Logging
     log_every: int = 10
+    log_dir: str | None = None  # Separate log directory (default: <output_dir>/logs)
     wandb_enabled: bool = False
     wandb_project: str = "wm-raw"
     wandb_entity: str = ""
@@ -860,7 +861,10 @@ def run_training(config: TrainingConfig) -> None:
         raise RuntimeError("VAE path required for diffusion training")
 
     # Metrics file
-    metrics_path = output_dir / "train_metrics.jsonl" if ctx.is_main else None
+    log_dir = Path(config.log_dir) if config.log_dir else output_dir
+    if ctx.is_main:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = log_dir / "train_metrics.jsonl" if ctx.is_main else None
 
     # WandB
     if ctx.is_main and config.wandb_enabled:

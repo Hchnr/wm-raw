@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """Text-to-image generation using a wm-raw checkpoint.
 
-Loads a trained wm-raw .pt checkpoint and generates images via Euler sampling
-of the flow-matching diffusion model with optional classifier-free guidance.
+Loads a trained wm-raw checkpoint (.pt or FSDP DCP directory) and generates
+images via Euler sampling of the flow-matching diffusion model with optional
+classifier-free guidance.
 
-Usage:
-    python scripts/generate_image.py \
-        --checkpoint outputs/gpic_image_diffusion/checkpoints/checkpoint_step_10000.pt \
-        --vae-path /path/to/ae.safetensors \
-        --vlm-path /path/to/Qwen3-VL-4B-Instruct \
+Condition format matches training: "Caption: {prompt} <|wm_predict_image|>"
+CFG unconditional uses sentinel-only: "<|wm_predict_image|>"
+
+Usage (our own DCP checkpoint):
+    CUDA_VISIBLE_DEVICES=1 python scripts/generate_image.py \
+        --checkpoint outputs/gpic_image_diffusion/checkpoints/step-000010 \
+        --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
+        --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --output generated.png
+        --num-steps 50 --timestep-shift 2.0 --cfg-scale 5.0 --seed 42 \
+        --output generated.png --device cuda
+
+Usage (online DCP checkpoint, comparable to interactive_generate_image.py):
+    CUDA_VISIBLE_DEVICES=1 python scripts/generate_image.py \
+        --checkpoint /share/project/eai_pwm/repos/wm-training/outputs/.../step_095000.dcp \
+        --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
+        --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
+        --prompt "a photo of a cat sitting on a windowsill" \
+        --num-steps 50 --timestep-shift 2.0 --cfg-scale 5.0 --seed 42 \
+        --output generated.png --device cuda
 """
 
 from __future__ import annotations
@@ -327,6 +341,10 @@ def main():
     parser.add_argument("--vlm-path", type=str, required=True, help="Path to Qwen3-VL processor")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
+    parser.add_argument("--condition-prefix", type=str, default="Caption: ",
+                        help="Prefix prepended to prompt (must match training format)")
+    parser.add_argument("--condition-suffix", type=str, default=" <|wm_predict_image|>",
+                        help="Suffix appended to prompt (must match training format)")
     parser.add_argument("--num-steps", type=int, default=50, help="Euler sampling steps")
     parser.add_argument("--timestep-shift", type=float, default=2.0, help="Flow timestep shift")
     parser.add_argument("--cfg-scale", type=float, default=5.0, help="CFG scale (1.0 = no CFG)")
@@ -382,18 +400,23 @@ def main():
     logger.info("Loading VAE: %s", args.vae_path)
     vae = load_vae(args.vae_path, device=device, dtype=dtype)
 
-    # 5. Encode condition
-    logger.info("Encoding prompt: %r", args.prompt)
-    cond_hidden = encode_text_condition(model, processor, args.prompt, device=device, dtype=dtype)
+    # 5. Encode condition (with prefix/suffix matching training format)
+    condition_text = f"{args.condition_prefix}{args.prompt}{args.condition_suffix}"
+    logger.info("Encoding condition: %r", condition_text)
+    cond_hidden = encode_text_condition(model, processor, condition_text, device=device, dtype=dtype)
 
     # 6. Encode negative condition (for CFG)
     uncond_hidden = None
     if args.cfg_scale != 1.0:
-        # Use a single pad/space token as unconditional embedding if prompt is empty
-        neg_prompt = args.negative_prompt if args.negative_prompt else " "
-        logger.info("Encoding negative prompt: %r", neg_prompt)
+        # Unconditional: use negative_prompt with prefix/suffix, or sentinel-only
+        if args.negative_prompt:
+            neg_text = f"{args.condition_prefix}{args.negative_prompt}{args.condition_suffix}"
+        else:
+            # Sentinel-only unconditional (matches online pipeline behavior)
+            neg_text = args.condition_suffix.strip()
+        logger.info("Encoding negative condition: %r", neg_text)
         uncond_hidden = encode_text_condition(
-            model, processor, neg_prompt, device=device, dtype=dtype
+            model, processor, neg_text, device=device, dtype=dtype
         )
 
     # 7. Generate
