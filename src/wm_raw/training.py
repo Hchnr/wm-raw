@@ -84,6 +84,9 @@ class TrainingConfig:
     # FSDP2
     fsdp2_enabled: bool = True
 
+    # torch.compile
+    compile_enabled: bool = False
+
     # Checkpoint
     save_every_steps: int = 1000
     resume_from: str | None = None
@@ -616,6 +619,12 @@ def run_training(config: TrainingConfig) -> None:
     # FSDP2
     if config.fsdp2_enabled and ctx.world_size > 1:
         model = apply_fsdp2(model, ctx=ctx)
+
+    # torch.compile
+    if config.compile_enabled:
+        model = torch.compile(model)
+        if ctx.is_main:
+            logger.info("torch.compile enabled")
 
     # Optimizer & scheduler
     optimizer = build_optimizer(model, config)

@@ -106,6 +106,7 @@ def main() -> None:
     # Distributed
     dist_cfg = raw_config.get("distributed", {})
     tc.fsdp2_enabled = dist_cfg.get("strategy", "fsdp2") == "fsdp2"
+    tc.compile_enabled = bool(dist_cfg.get("compile", False))
 
     # Logging
     log_cfg = raw_config.get("logging", {})

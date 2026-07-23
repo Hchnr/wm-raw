@@ -81,6 +81,7 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  compile: true
 
 logging:
   wandb_enabled: true
