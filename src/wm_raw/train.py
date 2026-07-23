@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
                         help="torch.compile mode (overrides config)")
     parser.add_argument("--wandb-project", type=str, default=None,
                         help="Override wandb project name")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="Override wandb entity (team/user)")
     parser.add_argument("--wandb-name", type=str, default=None,
                         help="Override wandb run name")
     parser.add_argument("--log-dir", type=str, default=None,
@@ -166,6 +168,8 @@ def main() -> None:
         tc.compile_mode = args.compile_mode
     if args.wandb_project is not None:
         tc.wandb_project = args.wandb_project
+    if args.wandb_entity is not None:
+        tc.wandb_entity = args.wandb_entity
     if args.wandb_name is not None:
         tc.wandb_name = args.wandb_name
     if args.log_dir is not None:
