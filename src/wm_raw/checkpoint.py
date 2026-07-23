@@ -55,6 +55,39 @@ class CheckpointReport:
                     lines.append(f"    ... and {len(keys) - max_items} more")
         return "\n".join(lines)
 
+    def log_errors(self, context: str = "checkpoint", max_items: int = 30) -> None:
+        """Emit ERROR-level log for each category of structural mismatch.
+
+        Call this after any checkpoint loading to ensure misalignment is visible
+        regardless of logging verbosity configuration.
+        """
+        if self.ok:
+            return
+
+        if self.missing:
+            items = "\n".join(f"    - {k}" for k in self.missing[:max_items])
+            extra = f"\n    ... and {len(self.missing) - max_items} more" if len(self.missing) > max_items else ""
+            logger.error(
+                "[%s] %d keys exist in model but NOT in checkpoint (missing):\n%s%s",
+                context, len(self.missing), items, extra,
+            )
+
+        if self.unexpected:
+            items = "\n".join(f"    - {k}" for k in self.unexpected[:max_items])
+            extra = f"\n    ... and {len(self.unexpected) - max_items} more" if len(self.unexpected) > max_items else ""
+            logger.error(
+                "[%s] %d keys exist in checkpoint but could NOT be mapped to model (unexpected):\n%s%s",
+                context, len(self.unexpected), items, extra,
+            )
+
+        if self.shape_mismatch:
+            items = "\n".join(f"    - {k}" for k in self.shape_mismatch[:max_items])
+            extra = f"\n    ... and {len(self.shape_mismatch) - max_items} more" if len(self.shape_mismatch) > max_items else ""
+            logger.error(
+                "[%s] %d keys have shape mismatch between model and checkpoint:\n%s%s",
+                context, len(self.shape_mismatch), items, extra,
+            )
+
 
 def _strip_prefix(state_dict: dict[str, Tensor], prefix: str) -> dict[str, Tensor]:
     """Remove a prefix from all keys in a state dict."""
@@ -364,6 +397,7 @@ def load_vlm_weights(
         raise RuntimeError(f"Strict checkpoint loading failed:\n{report.format()}")
 
     logger.info("VLM weights loaded: %s", report.format())
+    report.log_errors(context="load_vlm_weights")
     return report
 
 
@@ -436,6 +470,7 @@ def load_diffusion_weights(
         raise RuntimeError(f"Strict diffusion loading failed:\n{report.format()}")
 
     logger.info("Diffusion weights loaded: %s", report.format())
+    report.log_errors(context="load_diffusion_weights")
     return report
 
 
@@ -679,6 +714,7 @@ def load_online_dcp_weights(
         shape_mismatch=tuple(shape_mismatch),
     )
     logger.info("Online DCP weights loaded: %s", report.format())
+    report.log_errors(context="load_online_dcp_weights")
     return report
 
 
@@ -722,9 +758,45 @@ def load_checkpoint(
     *,
     map_location: str = "cpu",
 ) -> int:
-    """Load a training checkpoint. Returns global_step."""
+    """Load a training checkpoint. Returns global_step.
+
+    Validates structure alignment before loading: logs ERROR for any missing,
+    unexpected, or shape-mismatched keys between the checkpoint and the model.
+    """
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+    # --- Structure validation for model weights ---
+    ckpt_sd = checkpoint.get("model_state_dict", {})
+    model_sd = model.state_dict()
+    model_keys = set(model_sd.keys())
+    ckpt_keys = set(ckpt_sd.keys())
+
+    missing_keys = sorted(model_keys - ckpt_keys)
+    unexpected_keys = sorted(ckpt_keys - model_keys)
+    shape_mismatch: list[str] = []
+    matched_keys: list[str] = []
+
+    for key in sorted(model_keys & ckpt_keys):
+        if model_sd[key].shape != ckpt_sd[key].shape:
+            shape_mismatch.append(
+                f"{key}: model={list(model_sd[key].shape)} vs ckpt={list(ckpt_sd[key].shape)}"
+            )
+        else:
+            matched_keys.append(key)
+
+    report = CheckpointReport(
+        matched=len(matched_keys),
+        missing=tuple(missing_keys),
+        unexpected=tuple(unexpected_keys),
+        shape_mismatch=tuple(shape_mismatch),
+    )
+    logger.info("Checkpoint structure check: %s", report.format())
+    report.log_errors(context="load_checkpoint (single-file)")
+
+    # Load only the matched keys (safe subset)
+    load_dict = {k: ckpt_sd[k] for k in matched_keys}
+    model.load_state_dict(load_dict, strict=False)
+
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in checkpoint:
