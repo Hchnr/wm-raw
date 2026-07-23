@@ -21,6 +21,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="wm-raw training")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Skip pretrained weight loading (test pipeline with random weights)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Override max_steps from config")
     return parser.parse_args()
 
 
@@ -117,6 +121,12 @@ def main() -> None:
 
     # Compute dtype
     tc.compute_dtype = model_cfg.get("torch_dtype", "bfloat16")
+
+    # CLI overrides
+    if args.dry_run:
+        tc.skip_pretrained = True
+    if args.max_steps is not None:
+        tc.max_steps = args.max_steps
 
     run_training(tc)
 

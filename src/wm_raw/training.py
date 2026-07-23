@@ -108,6 +108,9 @@ class TrainingConfig:
     ema_decay: float = 0.9999
     ema_warmup_steps: int = 0
 
+    # Dry run (skip pretrained weight loading)
+    skip_pretrained: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Distributed utilities
@@ -512,8 +515,8 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "step": step,
         }
-        save(state, checkpoint_dir=str(checkpoint_dir))
-    except (ImportError, RuntimeError):
+        save(state, checkpoint_id=str(checkpoint_dir))
+    except (ImportError, RuntimeError, TypeError):
         # Fallback: single-file checkpoint (rank 0)
         if ctx.is_main:
             state = {
@@ -546,7 +549,7 @@ def load_checkpoint(
         )
 
         state = {"model": {}, "optimizer": {}, "scheduler": {}, "step": 0}
-        load(state, checkpoint_dir=str(path))
+        load(state, checkpoint_id=str(path))
         set_model_state_dict(model, state["model"])
         if optimizer is not None and state.get("optimizer"):
             set_optimizer_state_dict(model, optimizer, state["optimizer"])
@@ -592,13 +595,13 @@ def run_training(config: TrainingConfig) -> None:
     model = WorldModel(model_config)
 
     # Load pretrained weights
-    if config.vlm_path:
+    if config.vlm_path and not config.skip_pretrained:
         from .checkpoint import load_vlm_weights
         report = load_vlm_weights(model, config.vlm_path, dtype=compute_dtype)
         if ctx.is_main:
             logger.info(report.format())
 
-    if config.diffusion_path:
+    if config.diffusion_path and not config.skip_pretrained:
         from .checkpoint import load_diffusion_weights
         report = load_diffusion_weights(model, config.diffusion_path, dtype=compute_dtype)
         if ctx.is_main:
