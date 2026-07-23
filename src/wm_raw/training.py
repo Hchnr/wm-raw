@@ -86,9 +86,12 @@ class TrainingConfig:
 
     # torch.compile
     compile_enabled: bool = False
+    compile_mode: str = "default"  # "default" | "reduce-overhead" | "max-autotune"
 
     # Checkpoint
     save_every_steps: int = 1000
+    keep_last_n: int | None = None  # Keep only last N checkpoints (None = keep all)
+    save_final: bool = True  # Save checkpoint at end of training
     resume_from: str | None = None
 
     # Logging
@@ -296,6 +299,7 @@ def build_optimizer(
         groups,
         betas=(config.adam_beta1, config.adam_beta2),
         weight_decay=config.weight_decay,
+        fused=True,
     )
 
 
@@ -495,6 +499,7 @@ def save_checkpoint(
     output_dir: Path,
     *,
     ctx: DistContext,
+    keep_last_n: int | None = None,
 ) -> None:
     """Save a training checkpoint (rank 0 only for non-FSDP, DCP for FSDP)."""
     checkpoint_dir = output_dir / "checkpoints" / f"step-{step:06d}"
@@ -534,6 +539,18 @@ def save_checkpoint(
 
     if ctx.is_main:
         logger.info(f"Saved checkpoint at step {step}")
+
+    # Cleanup old checkpoints (rank 0 only)
+    if keep_last_n is not None and ctx.is_main:
+        ckpt_root = output_dir / "checkpoints"
+        existing = sorted(ckpt_root.iterdir()) if ckpt_root.exists() else []
+        existing = [d for d in existing if d.is_dir() and d.name.startswith("step-")]
+        if len(existing) > keep_last_n:
+            import shutil
+
+            for old_dir in existing[: len(existing) - keep_last_n]:
+                shutil.rmtree(old_dir)
+                logger.info(f"Removed old checkpoint: {old_dir.name}")
 
 
 def load_checkpoint(
@@ -623,9 +640,9 @@ def run_training(config: TrainingConfig) -> None:
 
     # torch.compile
     if config.compile_enabled:
-        model = torch.compile(model)
+        model = torch.compile(model, mode=config.compile_mode)
         if ctx.is_main:
-            logger.info("torch.compile enabled")
+            logger.info("torch.compile enabled (mode=%s)", config.compile_mode)
 
     # Optimizer & scheduler
     optimizer = build_optimizer(model, config)
@@ -782,10 +799,11 @@ def run_training(config: TrainingConfig) -> None:
 
         # Checkpointing
         if global_step % config.save_every_steps == 0:
-            save_checkpoint(model, optimizer, scheduler, global_step, output_dir, ctx=ctx)
+            save_checkpoint(model, optimizer, scheduler, global_step, output_dir, ctx=ctx, keep_last_n=config.keep_last_n)
 
     # Final save
-    save_checkpoint(model, optimizer, scheduler, global_step, output_dir, ctx=ctx)
+    if config.save_final:
+        save_checkpoint(model, optimizer, scheduler, global_step, output_dir, ctx=ctx, keep_last_n=config.keep_last_n)
     cleanup_distributed()
     if ctx.is_main:
         if config.wandb_enabled:

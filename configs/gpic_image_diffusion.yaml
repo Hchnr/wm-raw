@@ -82,11 +82,15 @@ training:
 
 checkpoint:
   save_every_steps: 5000
+  keep_last_n: 4
+  save_final: true
   resume_from:
 
 distributed:
   strategy: fsdp2
   compile: true
+  compile_mode: "reduce-overhead"  # 启用 CUDA Graph
+
 
 logging:
   wandb_enabled: true

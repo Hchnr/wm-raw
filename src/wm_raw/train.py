@@ -106,12 +106,17 @@ def main() -> None:
     # Checkpoint
     ckpt_cfg = raw_config.get("checkpoint", {})
     tc.save_every_steps = int(ckpt_cfg.get("save_every_steps", 1000))
+    tc.keep_last_n = ckpt_cfg.get("keep_last_n", None)
+    if tc.keep_last_n is not None:
+        tc.keep_last_n = int(tc.keep_last_n)
+    tc.save_final = bool(ckpt_cfg.get("save_final", True))
     tc.resume_from = args.resume or ckpt_cfg.get("resume_from")
 
     # Distributed
     dist_cfg = raw_config.get("distributed", {})
     tc.fsdp2_enabled = dist_cfg.get("strategy", "fsdp2") == "fsdp2"
     tc.compile_enabled = bool(dist_cfg.get("compile", False))
+    tc.compile_mode = dist_cfg.get("compile_mode", "default")
 
     # Logging
     log_cfg = raw_config.get("logging", {})
