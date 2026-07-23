@@ -790,9 +790,9 @@ def run_training(config: TrainingConfig) -> None:
 
     # torch.compile
     if config.compile_enabled:
-        model = torch.compile(model, mode=config.compile_mode)
+        model = torch.compile(model, mode=config.compile_mode, dynamic=False)
         if ctx.is_main:
-            logger.info("torch.compile enabled (mode=%s)", config.compile_mode)
+            logger.info("torch.compile enabled (mode=%s, dynamic=False)", config.compile_mode)
 
     # Optimizer & scheduler
     optimizer = build_optimizer(model, config)
