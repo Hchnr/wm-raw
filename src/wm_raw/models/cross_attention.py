@@ -68,20 +68,40 @@ class CrossAttentionAdapter(nn.Module):
 
     def forward(
         self,
-        diffusion_hidden: Tensor,  # [B, S_diff, D_diff]
-        context_hidden: Tensor,  # [B, S_vlm, D_vlm]
+        diffusion_hidden: Tensor | None = None,  # [B, S_diff, D_diff]
+        context_hidden: Tensor | None = None,  # [B, S_vlm, D_vlm]
         attention_mask: Tensor | None = None,  # [B, 1, S_diff, S_vlm]
-    ) -> Tensor:
+        *,
+        mode: str = "full",  # "full" | "kv_only"
+        target_device: torch.device | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Cross-attend from diffusion to VLM context.
 
-        Args:
-            diffusion_hidden: [B, S_diff, D_diff]
-            context_hidden: [B, S_vlm, D_vlm]
-            attention_mask: optional [B, 1, S_diff, S_vlm]
-
-        Returns:
-            output: [B, S_diff, D_diff] — gated residual added to input
+        Modes:
+            "full": full cross-attention (requires diffusion_hidden + context_hidden).
+                Returns: [B, S_diff, D_diff] — gated residual added to input.
+            "kv_only": project context into K/V only (requires context_hidden).
+                Returns: (k, v) with shape [B, H_kv, S_vlm, D].
         """
+        if mode == "kv_only":
+            assert context_hidden is not None
+            if target_device is not None or target_dtype is not None:
+                context_hidden = context_hidden.to(
+                    device=target_device or context_hidden.device,
+                    dtype=target_dtype or context_hidden.dtype,
+                )
+            kv_input = self.context_norm(context_hidden)
+            batch, seq_vlm, _ = kv_input.shape
+
+            k = self.k_proj(kv_input.to(self.k_proj.weight.dtype))
+            v = self.v_proj(kv_input.to(self.v_proj.weight.dtype))
+            k = k.view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            return k, v
+
+        # mode == "full"
+        assert diffusion_hidden is not None and context_hidden is not None
         residual = diffusion_hidden
         batch, seq_diff, _ = diffusion_hidden.shape
         _, seq_vlm, _ = context_hidden.shape
@@ -129,26 +149,14 @@ class CrossAttentionAdapter(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Pre-project context K/V for cross_kv_concat mode.
 
-        Projects VLM hidden states into K, V that will be concatenated
-        to the diffusion self-attention K/V inside each decoder layer.
-
-        Returns:
-            k: [B, H_kv, S_vlm, D]
-            v: [B, H_kv, S_vlm, D]
+        Delegates to forward(mode="kv_only") so that FSDP2 hooks fire correctly.
         """
-        if target_device is not None or target_dtype is not None:
-            context_hidden = context_hidden.to(
-                device=target_device or context_hidden.device,
-                dtype=target_dtype or context_hidden.dtype,
-            )
-        kv_input = self.context_norm(context_hidden)
-        batch, seq_vlm, _ = kv_input.shape
-
-        k = self.k_proj(kv_input.to(self.k_proj.weight.dtype))
-        v = self.v_proj(kv_input.to(self.v_proj.weight.dtype))
-        k = k.view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_vlm, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        return k, v
+        return self(
+            context_hidden=context_hidden,
+            mode="kv_only",
+            target_device=target_device,
+            target_dtype=target_dtype,
+        )
 
 
 def build_layer_map(
