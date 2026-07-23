@@ -151,15 +151,25 @@ class Sincos2DPositionEmbedding(nn.Module):
 class ContinuousTokenProjector(nn.Module):
     """Projects continuous-valued tokens into model hidden dimension.
 
-    LayerNorm → Linear. Used for projecting VAE latent tokens or state vectors
-    into the diffusion backbone's hidden size.
+    When normalize_input=True: LayerNorm → Linear.
+    When normalize_input=False: Linear only (+ input_projection_version buffer).
     """
 
-    def __init__(self, input_dim: int, hidden_size: int) -> None:
+    def __init__(
+        self, input_dim: int, hidden_size: int, normalize_input: bool = True
+    ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(input_dim)
+        self.norm = nn.LayerNorm(input_dim) if normalize_input else None
         self.proj = nn.Linear(input_dim, hidden_size)
+        if not normalize_input:
+            self.register_buffer(
+                "input_projection_version",
+                torch.tensor(2, dtype=torch.int64),
+                persistent=True,
+            )
 
     def forward(self, tokens: Tensor) -> Tensor:
         """Project tokens: [B, S, input_dim] → [B, S, hidden_size]."""
-        return self.proj(self.norm(tokens))
+        if self.norm is not None:
+            tokens = self.norm(tokens)
+        return self.proj(tokens)

@@ -482,6 +482,7 @@ _ONLINE_PREFIX_MAP = [
     ("model.state_diffusion_branch.adaln_modulations.", "model.state_diffusion.adaln_layers."),
     # Diffusion backbone layers
     ("model.state_diffusion_branch.backbone.layers.", "model.state_diffusion.layers."),
+    ("model.state_diffusion_branch.backbone.norm.", "model.state_diffusion.final_norm."),
     ("model.state_diffusion_branch.backbone.embed_tokens.", None),  # skip
     # Diffusion input projector
     ("model.state_diffusion_branch.input_projector.", "model.state_diffusion.input_proj."),

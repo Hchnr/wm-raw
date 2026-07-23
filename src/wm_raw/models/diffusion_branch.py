@@ -134,12 +134,14 @@ class StateDiffusionBranch(nn.Module):
         self.num_latent_tokens = patch_h * patch_w
         self.token_dim = token_dim
 
-        # Input projection: latent token → hidden
-        self.input_proj = ContinuousTokenProjector(token_dim, config.hidden_size)
+        # Input projection: latent token → hidden (no normalization, matches online)
+        self.input_proj = ContinuousTokenProjector(
+            token_dim, config.hidden_size, normalize_input=False
+        )
 
         # Timestep embedding
         self.time_embedder = SinusoidalTimestepEmbedding(
-            frequency_dim=config.hidden_size,
+            frequency_dim=config.timestep_frequency_dim,
             hidden_size=config.hidden_size,
         )
         # Timestep → hidden additive conditioning
@@ -172,7 +174,9 @@ class StateDiffusionBranch(nn.Module):
 
         # Final norm + output projection
         self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.output_head = nn.Linear(config.hidden_size, token_dim, bias=False)
+        self.output_head = nn.Linear(config.hidden_size, token_dim, bias=True)
+        nn.init.zeros_(self.output_head.weight)
+        nn.init.zeros_(self.output_head.bias)
 
         # Rotary embedding for diffusion sequence
         self.rotary_emb = TextMRoPE(
