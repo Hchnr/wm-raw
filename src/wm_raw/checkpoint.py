@@ -464,6 +464,222 @@ def load_pretrained_weights(
     return vlm_report, diff_report
 
 
+# ---------------------------------------------------------------------------
+# Online DCP checkpoint loading (wm-training → wm-raw key remapping)
+# ---------------------------------------------------------------------------
+
+# Key mapping: online (wm-training) prefix → wm-raw prefix
+_ONLINE_PREFIX_MAP = [
+    # VLM text (language model)
+    ("model.vlm_branch.backbone.model.language_model.", "model.vlm."),
+    # VLM lm_head
+    ("model.vlm_branch.backbone.lm_head.", "model.vlm.lm_head."),
+    # VLM vision encoder
+    ("model.vlm_branch.backbone.model.visual.", "model.vlm.vision_encoder."),
+    # Cross attention: drop "state." sub-key (action adapters are ignored)
+    ("model.cross_attention.adapters.state.", "model.cross_attention.adapters."),
+    # Diffusion adaln
+    ("model.state_diffusion_branch.adaln_modulations.", "model.state_diffusion.adaln_layers."),
+    # Diffusion backbone layers
+    ("model.state_diffusion_branch.backbone.layers.", "model.state_diffusion.layers."),
+    ("model.state_diffusion_branch.backbone.embed_tokens.", None),  # skip
+    # Diffusion input projector
+    ("model.state_diffusion_branch.input_projector.", "model.state_diffusion.input_proj."),
+    # Diffusion time conditioner/embedder
+    ("model.state_diffusion_branch.time_conditioner.", "model.state_diffusion.time_conditioner."),
+    ("model.state_diffusion_branch.time_embedder.", "model.state_diffusion.time_embedder."),
+    # Diffusion output head
+    ("model.state_diffusion_branch.output_head.", "model.state_diffusion.output_head."),
+    # Skip online-only components
+    ("model.state_diffusion_branch.peer_conditioner.", None),
+    ("model.state_diffusion_branch.latent_position_embedding.", None),
+    ("model.state_diffusion_branch.adapter.", None),
+    ("model.action_diffusion_branch.", None),
+    ("model.cross_attention.adapters.action.", None),
+]
+
+
+def _map_online_key(key: str) -> str | None:
+    """Map an online (wm-training) DCP key to wm-raw key.
+
+    Returns None for keys that should be skipped (no equivalent in wm-raw).
+    Returns the key itself for fused QKV that needs special handling.
+    """
+    import re
+
+    for online_prefix, raw_prefix in _ONLINE_PREFIX_MAP:
+        if not key.startswith(online_prefix):
+            continue
+        if raw_prefix is None:
+            return None  # skip this key
+
+        suffix = key[len(online_prefix):]
+
+        # Diffusion backbone layers need .layer. insertion
+        if online_prefix == "model.state_diffusion_branch.backbone.layers.":
+            match = re.match(r"(\d+)\.(.*)", suffix)
+            if match:
+                layer_idx, rest = match.group(1), match.group(2)
+                return f"{raw_prefix}{layer_idx}.layer.{rest}"
+
+        # Vision encoder: rename keys and skip fused QKV
+        if online_prefix == "model.vlm_branch.backbone.model.visual.":
+            if "attn.qkv." in suffix:
+                return None  # handled by _split_online_vision_qkv
+            for old, new in _VISION_KEY_RENAMES.items():
+                if old in suffix:
+                    suffix = suffix.replace(old, new)
+                    break
+            for old, new in _VISION_MERGER_RENAMES.items():
+                if old in suffix:
+                    suffix = suffix.replace(old, new)
+                    break
+
+        return raw_prefix + suffix
+
+    return None  # not matched
+
+
+def _split_online_vision_qkv(
+    state_dict: dict[str, Tensor],
+) -> dict[str, Tensor]:
+    """Split fused QKV from online vision encoder into separate Q, K, V.
+
+    Online key: model.vlm_branch.backbone.model.visual.blocks.N.attn.qkv.{weight,bias}
+    wm-raw:     model.vlm.vision_encoder.blocks.N.attn.{q,k,v}_proj.{weight,bias}
+    """
+    import re
+
+    result: dict[str, Tensor] = {}
+    prefix = "model.vlm_branch.backbone.model.visual."
+
+    for key, tensor in state_dict.items():
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix):]
+        if "attn.qkv." not in suffix:
+            continue
+
+        # suffix like: blocks.0.attn.qkv.weight
+        match = re.match(r"blocks\.(\d+)\.attn\.qkv\.(weight|bias)", suffix)
+        if not match:
+            continue
+
+        block_idx = match.group(1)
+        param_type = match.group(2)
+        # Split [3*D, ...] → 3 × [D, ...]
+        chunks = tensor.chunk(3, dim=0)
+        for proj_name, chunk in zip(("q_proj", "k_proj", "v_proj"), chunks):
+            out_key = f"model.vlm.vision_encoder.blocks.{block_idx}.attn.{proj_name}.{param_type}"
+            result[out_key] = chunk
+
+    return result
+
+
+def load_online_dcp_weights(
+    model: Any,
+    dcp_path: str | Path,
+    *,
+    dtype: torch.dtype | None = None,
+) -> CheckpointReport:
+    """Load model weights from an online (wm-training) DCP checkpoint.
+
+    This handles the key remapping between wm-training's model structure and
+    wm-raw's model structure. Only model weights are loaded (no optimizer/scheduler).
+    Supports resharding across different world sizes (e.g. 8 GPU → 2 GPU).
+
+    Args:
+        model: WorldModel instance (before FSDP wrapping)
+        dcp_path: path to the .dcp directory
+        dtype: cast loaded tensors to this dtype
+
+    Returns:
+        CheckpointReport summarizing the loading
+    """
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+
+    dcp_path = Path(dcp_path)
+    if not (dcp_path / ".metadata").exists():
+        raise FileNotFoundError(f"Not a DCP checkpoint: {dcp_path}")
+
+    # Read metadata to get all model keys
+    reader = FileSystemReader(str(dcp_path))
+    metadata = reader.read_metadata()
+    all_keys = list(metadata.state_dict_metadata.keys())
+    model_keys = [k for k in all_keys if k.startswith("model.")]
+
+    # Load only model keys as full state dict using DCP
+    # Build a placeholder state dict to load into
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+    # Use dcp.load with the model keys we want
+    # We load into a flat dict - need to create empty tensors as targets
+    state_dict: dict[str, Tensor] = {}
+    for key in model_keys:
+        md = metadata.state_dict_metadata[key]
+        # Only load TensorStorageMetadata (skip BytesStorageMetadata)
+        from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+        if isinstance(md, TensorStorageMetadata):
+            state_dict[key] = torch.empty(md.size, dtype=md.properties.dtype)
+
+    dcp.load(state_dict, checkpoint_id=str(dcp_path))
+
+    # Remap keys
+    remapped: dict[str, Tensor] = {}
+    unmapped: list[str] = []
+
+    # First handle fused QKV split
+    qkv_split = _split_online_vision_qkv(state_dict)
+    remapped.update(qkv_split)
+
+    # Map remaining keys
+    for key, tensor in state_dict.items():
+        mapped = _map_online_key(key)
+        if mapped is None:
+            continue  # skip
+        if mapped in remapped:
+            continue  # already handled by QKV split
+        remapped[mapped] = tensor
+
+    # Strip "model." prefix since model.load_state_dict expects unprefixed keys
+    final_sd: dict[str, Tensor] = {}
+    for key, tensor in remapped.items():
+        if key.startswith("model."):
+            key = key[len("model."):]
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        final_sd[key] = tensor
+
+    # Load into model
+    model_sd = model.state_dict()
+    model_keys_expected = set(model_sd.keys())
+    shape_mismatch: list[str] = []
+    to_load: dict[str, Tensor] = {}
+
+    for key, tensor in final_sd.items():
+        if key not in model_keys_expected:
+            unmapped.append(key)
+            continue
+        # Check shape
+        if tensor.shape != model_sd[key].shape:
+            shape_mismatch.append(f"{key}: online={list(tensor.shape)} vs ours={list(model_sd[key].shape)}")
+            continue
+        to_load[key] = tensor
+
+    missing_keys = model_keys_expected - set(to_load.keys())
+    model.load_state_dict(to_load, strict=False)
+
+    report = CheckpointReport(
+        matched=len(to_load),
+        missing=tuple(sorted(missing_keys)),
+        unexpected=tuple(unmapped[:50]),
+        shape_mismatch=tuple(shape_mismatch),
+    )
+    logger.info("Online DCP weights loaded: %s", report.format())
+    return report
+
+
 def save_checkpoint(
     model: Any,
     optimizer: Any,

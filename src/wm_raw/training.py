@@ -650,16 +650,34 @@ def run_training(config: TrainingConfig) -> None:
     model_config = WorldModelConfig()  # Use defaults (4B VLM + 2B diffusion)
     model = WorldModel(model_config)
 
-    # Load pretrained weights
-    if config.vlm_path and not config.skip_pretrained:
-        from .checkpoint import load_vlm_weights
-        report = load_vlm_weights(model, config.vlm_path, dtype=compute_dtype)
-        if ctx.is_main:
-            logger.info(report.format())
+    # Detect if resume_from is an online (wm-training) DCP checkpoint
+    _is_online_resume = False
+    if config.resume_from:
+        _resume_path = Path(config.resume_from)
+        if (_resume_path / ".metadata").exists():
+            from torch.distributed.checkpoint import FileSystemReader
+            _reader = FileSystemReader(str(_resume_path))
+            _meta = _reader.read_metadata()
+            _sample_keys = list(_meta.state_dict_metadata.keys())[:5]
+            _is_online_resume = any("vlm_branch" in k for k in _sample_keys)
 
-    if config.diffusion_path and not config.skip_pretrained:
-        from .checkpoint import load_diffusion_weights
-        report = load_diffusion_weights(model, config.diffusion_path, dtype=compute_dtype)
+    # Load pretrained weights (skip if resuming from online DCP — it already has them)
+    if not _is_online_resume:
+        if config.vlm_path and not config.skip_pretrained:
+            from .checkpoint import load_vlm_weights
+            report = load_vlm_weights(model, config.vlm_path, dtype=compute_dtype)
+            if ctx.is_main:
+                logger.info(report.format())
+
+        if config.diffusion_path and not config.skip_pretrained:
+            from .checkpoint import load_diffusion_weights
+            report = load_diffusion_weights(model, config.diffusion_path, dtype=compute_dtype)
+            if ctx.is_main:
+                logger.info(report.format())
+    else:
+        # Load from online DCP (before FSDP wrapping, model weights only)
+        from .checkpoint import load_online_dcp_weights
+        report = load_online_dcp_weights(model, config.resume_from, dtype=compute_dtype)
         if ctx.is_main:
             logger.info(report.format())
 
@@ -682,9 +700,9 @@ def run_training(config: TrainingConfig) -> None:
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
 
-    # Resume
+    # Resume (only for our own DCP checkpoints — online DCP was loaded above)
     global_step = 0
-    if config.resume_from:
+    if config.resume_from and not _is_online_resume:
         global_step = load_checkpoint(config.resume_from, model, optimizer, scheduler)
         if ctx.is_main:
             logger.info(f"Resumed from step {global_step}")
