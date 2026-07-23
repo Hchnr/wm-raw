@@ -510,22 +510,23 @@ def save_checkpoint(
 
     # For FSDP2, use distributed checkpoint
     try:
-        from torch.distributed.checkpoint import save
+        import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import (
             get_model_state_dict,
             get_optimizer_state_dict,
             StateDictOptions,
         )
 
-        model_sd = get_model_state_dict(model)
-        optim_sd = get_optimizer_state_dict(model, optimizer)
+        options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+        model_sd = get_model_state_dict(model, options=options)
+        optim_sd = get_optimizer_state_dict(model, optimizer, options=options)
         state = {
             "model": model_sd,
             "optimizer": optim_sd,
             "scheduler": scheduler.state_dict(),
             "step": step,
         }
-        save(state, checkpoint_id=str(checkpoint_dir))
+        dcp.save(state, checkpoint_id=str(checkpoint_dir))
     except (ImportError, RuntimeError, TypeError):
         # Fallback: single-file checkpoint (rank 0)
         if ctx.is_main:
@@ -559,27 +560,58 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any | None = None,
 ) -> int:
-    """Load a training checkpoint. Returns the global step."""
+    """Load a training checkpoint. Returns the global step.
+
+    Supports:
+    - DCP (distributed checkpoint) with automatic resharding across different
+      world sizes (e.g. saved on 8 GPUs, resumed on 2 GPUs).
+    - Single-file checkpoint fallback for non-FSDP runs.
+    """
     path = Path(path)
 
-    # Try DCP first
-    if (path / "metadata.pt").exists() or (path / ".metadata").exists():
-        from torch.distributed.checkpoint import load
+    # Try DCP first (FSDP2 distributed checkpoint)
+    if (path / ".metadata").exists():
+        import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
             set_model_state_dict,
             set_optimizer_state_dict,
+            StateDictOptions,
         )
 
-        state = {"model": {}, "optimizer": {}, "scheduler": {}, "step": 0}
-        load(state, checkpoint_id=str(path))
-        set_model_state_dict(model, state["model"])
-        if optimizer is not None and state.get("optimizer"):
-            set_optimizer_state_dict(model, optimizer, state["optimizer"])
-        if scheduler is not None and state.get("scheduler"):
-            scheduler.load_state_dict(state["scheduler"])
-        return int(state.get("step", 0))
+        options = StateDictOptions(full_state_dict=False, cpu_offload=True)
 
-    # Fallback: single file
+        # Build target state dicts that DCP can reshard into.
+        # These carry the current FSDP sharding info so DCP knows how to
+        # redistribute tensors from a different world size.
+        model_state = get_model_state_dict(model, options=options)
+        payload: dict[str, Any] = {"model": model_state}
+
+        if optimizer is not None:
+            optim_state = get_optimizer_state_dict(model, optimizer, options=options)
+            payload["optimizer"] = optim_state
+
+        # Scheduler and step are non-sharded scalars stored in the same DCP
+        payload["scheduler"] = {}
+        payload["step"] = 0
+
+        dcp.load(payload, checkpoint_id=str(path))
+
+        # Apply loaded state back to model/optimizer
+        set_model_state_dict(model, payload["model"], options=options)
+        if optimizer is not None and payload.get("optimizer"):
+            set_optimizer_state_dict(
+                model, optimizer, payload["optimizer"], options=options
+            )
+        if scheduler is not None and payload.get("scheduler"):
+            scheduler.load_state_dict(payload["scheduler"])
+
+        step = int(payload.get("step", 0))
+        logger.info(f"Resumed from DCP checkpoint: {path} at step {step}")
+        return step
+
+    # Fallback: single file (non-FSDP)
     ckpt_file = path / "checkpoint.pt" if path.is_dir() else path
     state = torch.load(str(ckpt_file), map_location="cpu", weights_only=False)
     model.load_state_dict(state["model"], strict=False)
@@ -587,7 +619,9 @@ def load_checkpoint(
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and "scheduler" in state:
         scheduler.load_state_dict(state["scheduler"])
-    return int(state.get("step", 0))
+    step = int(state.get("step", 0))
+    logger.info(f"Resumed from single-file checkpoint: {ckpt_file} at step {step}")
+    return step
 
 
 # ---------------------------------------------------------------------------

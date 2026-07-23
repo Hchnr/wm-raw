@@ -72,7 +72,6 @@ ema:
 
 training:
   max_steps: 200000
-  max_steps: 100
   log_every: 10
   output_dir: outputs/gpic_image_diffusion
   # Fixed sequence length for static compilation / CUDA Graph
