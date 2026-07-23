@@ -1,0 +1,99 @@
+# wm-raw: GPIC image-only diffusion training config
+# Aligned with: qwen3vl_gpic_patchlatent_2dpos_adaln_fm_shift2_200k_fsdp.yaml
+#
+# Usage:
+#   torchrun --nproc_per_node=8 -m wm_raw.train --config configs/gpic_image_diffusion.yaml
+
+model:
+  vlm_path: /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct
+  # vlm_path: /root/local_models/Qwen3-VL-4B-Instruct  # 本地缓存（拷贝后取消注释，加速加载）
+  diffusion_path: /share/project/eai_pwm/models/Qwen3-VL-2B-Instruct
+  # diffusion_path: /root/local_models/Qwen3-VL-2B-Instruct  # 本地缓存
+  torch_dtype: bfloat16
+  # Cross-attention and layer mapping (matches online experiment)
+  communication_policy: cross_kv_concat
+  layer_mapping_policy: middle_n
+  hidden_state_layer_offset: 1
+  cross_attention_gate_init: 0.01
+  # Latent diffusion settings
+  latent:
+    objective: flow_matching
+    prediction_type: flow
+    timestep_shift: 2.0
+    timestep_frequency_dim: 256
+    timestep_conditioning: adaln_zero
+    tokenization: patchified
+    patch_size: 2
+    position_embedding: bagel_2d_sincos
+    max_position_size: 64
+
+vae:
+  model_path: /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors
+  # model_path: /root/local_models/BAGEL-7B-MoT/ae.safetensors  # 本地缓存
+  frozen: true
+  image_size: 256
+
+data:
+  dataset_type: wm_sequence_prepared
+  prepared_root: /share/project/eai_pwm/prepared_datasets/gpic_train_v1_94_incremental
+  image_size: 256
+  batch_size: 8
+  num_workers: 4
+  seed: 42
+  condition_prefix: "Caption: "
+  condition_suffix: " <|wm_predict_image|>"
+  text_condition_dropout_prob: 0.1
+
+multitask:
+  vlm_microbatches_per_step: 0
+  diffusion_microbatches_per_step: 1
+  trainable_mode: diffusion
+  train_diffusion_backbone: true
+  vlm_loss_weight: 0.0
+  state_loss_weight: 1.0
+
+optimizer:
+  adapter_learning_rate: 1.0e-4
+  diffusion_learning_rate: 1.0e-4
+  vlm_learning_rate: 0.0
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 5.0
+
+scheduler:
+  type: constant
+  warmup_steps: 2500
+
+ema:
+  enabled: true
+  decay: 0.9995
+  warmup_steps: 0
+
+training:
+  max_steps: 200000
+  log_every: 10
+  output_dir: outputs/gpic_image_diffusion
+  # Fixed sequence length for static compilation / CUDA Graph
+  fixed_seqlen:
+    enabled: true
+    # P99.9=220, aligned to 64 -> 256. Truncates only 0.03% of samples.
+    condition_max_seq_len: 256
+
+checkpoint:
+  save_every_steps: 5000
+  keep_last_n: 4
+  save_final: true
+  resume_from:
+
+distributed:
+  strategy: fsdp2
+  compile: true
+  compile_mode: "reduce-overhead"  # 启用 CUDA Graph
+
+
+logging:
+  wandb_enabled: true
+  wandb_project: wm-raw
+  wandb_entity: hechenrui123-beijing-academy-of-artificial-intelligence
+  wandb_name: gpic-patchlatent-adaln-fm-shift2-200k-pytorch
