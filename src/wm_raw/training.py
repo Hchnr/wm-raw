@@ -65,6 +65,7 @@ class TrainingConfig:
     weight_decay: float = 0.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
+    adam_fused: bool = True
     max_grad_norm: float = 1.0
 
     # Schedule
@@ -299,7 +300,7 @@ def build_optimizer(
         groups,
         betas=(config.adam_beta1, config.adam_beta2),
         weight_decay=config.weight_decay,
-        fused=True,
+        fused=config.adam_fused,
     )
 
 
