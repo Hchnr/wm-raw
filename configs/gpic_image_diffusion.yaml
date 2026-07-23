@@ -54,7 +54,7 @@ multitask:
 
 optimizer:
   adapter_learning_rate: 1.0e-4
-  diffusion_learning_rate: 5.0e-5
+  diffusion_learning_rate: 1.0e-4
   vlm_learning_rate: 0.0
   weight_decay: 0.0
   adam_beta1: 0.9
@@ -63,7 +63,7 @@ optimizer:
 
 scheduler:
   type: constant
-  warmup_steps: 5000
+  warmup_steps: 2500
 
 ema:
   enabled: true
@@ -72,6 +72,7 @@ ema:
 
 training:
   max_steps: 200000
+  max_steps: 100
   log_every: 10
   output_dir: outputs/gpic_image_diffusion
   # Fixed sequence length for static compilation / CUDA Graph

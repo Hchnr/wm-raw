@@ -793,9 +793,12 @@ def run_training(config: TrainingConfig) -> None:
                 with metrics_path.open("a") as f:
                     f.write(json.dumps(metrics) + "\n")
             if config.wandb_enabled:
-                import wandb
+                try:
+                    import wandb
 
-                wandb.log(metrics, step=global_step)
+                    wandb.log(metrics, step=global_step)
+                except Exception:
+                    pass  # Don't let wandb crash training
 
         # Checkpointing
         if global_step % config.save_every_steps == 0:
@@ -807,7 +810,10 @@ def run_training(config: TrainingConfig) -> None:
     cleanup_distributed()
     if ctx.is_main:
         if config.wandb_enabled:
-            import wandb
+            try:
+                import wandb
 
-            wandb.finish()
+                wandb.finish()
+            except Exception:
+                pass
         logger.info(f"Training complete. Final step: {global_step}")
