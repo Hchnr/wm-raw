@@ -264,20 +264,24 @@ class StateDiffusionBranch(nn.Module):
         # External (VLM context) tokens are all visible; self-attention is bidirectional
         combined_mask = attention_mask  # will be None for no masking (all-to-all)
 
+        # Pre-project all VLM context K/V outside the layer loop.
+        # This avoids dynamo recompilation per diffusion_layer_idx (each idx
+        # value would trigger a new guard → hit recompile_limit after 8 layers).
+        all_external_kv: list[tuple[Tensor, Tensor]] | None = None
+        if cross_attention_stack is not None and vlm_hidden_states is not None:
+            all_external_kv = cross_attention_stack.project_all_context_kv(
+                vlm_hidden_states,
+                target_device=hidden.device,
+                target_dtype=hidden.dtype,
+            )
+
         # Run decoder layers
         for layer_idx, (layer, adaln) in enumerate(zip(self.layers, self.adaln_layers)):
             # Compute AdaLN params from timestep
             adaln_params = adaln(time_hidden)
 
-            # Project VLM context into K/V for this layer (cross_kv_concat)
-            external_kv = None
-            if cross_attention_stack is not None and vlm_hidden_states is not None:
-                external_kv = cross_attention_stack.project_context_kv(
-                    layer_idx,
-                    vlm_hidden_states,
-                    target_device=hidden.device,
-                    target_dtype=hidden.dtype,
-                )
+            # Retrieve pre-projected K/V for this layer
+            external_kv = all_external_kv[layer_idx] if all_external_kv is not None else None
 
             # Decoder layer with AdaLN modulation + external KV
             hidden = layer(

@@ -231,6 +231,33 @@ class CrossAttentionStack(nn.Module):
             for _ in range(num_diffusion_layers)
         ])
 
+    def project_all_context_kv(
+        self,
+        vlm_hidden_states: Sequence[Tensor],
+        *,
+        target_device: torch.device | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Project VLM context into K/V for all diffusion layers at once.
+
+        Avoids per-layer dynamo recompilation by unrolling all adapters in a
+        single traced function (layer count is a compile-time constant).
+
+        Returns:
+            List of (k, v) tuples, one per diffusion layer.
+            k/v shape: [B, H_kv, S_vlm, D]
+        """
+        results: list[tuple[Tensor, Tensor]] = []
+        for layer_idx in range(len(self.adapters)):
+            state_index = self.layer_map[layer_idx] + self.hidden_state_layer_offset
+            context = vlm_hidden_states[state_index]
+            adapter = self.adapters[layer_idx]
+            results.append(
+                adapter(context_hidden=context, mode="kv_only",
+                        target_device=target_device, target_dtype=target_dtype)
+            )
+        return results
+
     def project_context_kv(
         self,
         diffusion_layer_idx: int,
