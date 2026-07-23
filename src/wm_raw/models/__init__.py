@@ -3,7 +3,7 @@
 from .adaln import AdaLNZero, SinusoidalTimestepEmbedding
 from .cross_attention import CrossAttentionAdapter, CrossAttentionStack, build_layer_map
 from .diffusion_branch import DiffusionDecoderLayer, StateDiffusionBranch
-from .embeddings import ContinuousTokenProjector, Sincos2DPositionEmbedding, patchify_latent, unpatchify_latent
+from .embeddings import BagelGridPositionEmbedding, ContinuousTokenProjector, Sincos2DPositionEmbedding, patchify_latent, unpatchify_latent
 from .model import DiffusionOutput, WorldModel, WorldModelOutput
 from .qwen3vl_backbone import DecoderLayer, RMSNorm, TextAttention, TextMLP
 from .rope import TextMRoPE, VisionRotaryEmbedding, apply_rotary_pos_emb
@@ -12,6 +12,7 @@ from .vlm import VLMBranch, VLMOutput
 
 __all__ = [
     "AdaLNZero",
+    "BagelGridPositionEmbedding",
     "CrossAttentionAdapter",
     "CrossAttentionStack",
     "ContinuousTokenProjector",

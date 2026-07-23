@@ -250,7 +250,7 @@ def build_optimizer(
         raw_model.state_diffusion.time_conditioner,
         raw_model.state_diffusion.adaln_layers,
         raw_model.state_diffusion.output_head,
-        raw_model.state_diffusion.position_embedding,
+        raw_model.state_diffusion.latent_position_embedding,
     ]
     for module in adapter_modules:
         if module is None:
@@ -348,7 +348,7 @@ def configure_trainable(model: WorldModel, config: TrainingConfig) -> None:
             model.state_diffusion.time_conditioner,
             model.state_diffusion.adaln_layers,
             model.state_diffusion.output_head,
-            model.state_diffusion.position_embedding,
+            model.state_diffusion.latent_position_embedding,
         ]:
             if module is not None:
                 for p in module.parameters():

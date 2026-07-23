@@ -491,9 +491,10 @@ _ONLINE_PREFIX_MAP = [
     ("model.state_diffusion_branch.time_embedder.", "model.state_diffusion.time_embedder."),
     # Diffusion output head
     ("model.state_diffusion_branch.output_head.", "model.state_diffusion.output_head."),
+    # Diffusion position embedding
+    ("model.state_diffusion_branch.latent_position_embedding.", "model.state_diffusion.latent_position_embedding."),
     # Skip online-only components
     ("model.state_diffusion_branch.peer_conditioner.", None),
-    ("model.state_diffusion_branch.latent_position_embedding.", None),
     ("model.state_diffusion_branch.adapter.", None),
     ("model.action_diffusion_branch.", None),
     ("model.cross_attention.adapters.action.", None),

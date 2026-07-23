@@ -148,6 +148,79 @@ class Sincos2DPositionEmbedding(nn.Module):
         return pe.reshape(grid_h * grid_w, embed_dim)
 
 
+class BagelGridPositionEmbedding(nn.Module):
+    """Frozen 2D sine/cosine position table, matches BAGEL/wm-training.
+
+    Stores a [max_num_patch_per_side^2, hidden_size] table as a frozen nn.Parameter.
+    Forward indexes with flattened position_ids: row * max_position_size + col.
+    """
+
+    def __init__(self, max_num_patch_per_side: int, hidden_size: int) -> None:
+        super().__init__()
+        self.max_num_patch_per_side = max_num_patch_per_side
+        self.hidden_size = hidden_size
+        self.pos_embed = nn.Parameter(
+            torch.zeros(max_num_patch_per_side ** 2, hidden_size),
+            requires_grad=False,
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        pos_embed = self._build_2d_sincos(self.hidden_size, self.max_num_patch_per_side)
+        self.pos_embed.data.copy_(pos_embed.to(dtype=torch.float32))
+
+    def make_position_ids(self, grid_h: int, grid_w: int, batch_size: int) -> Tensor:
+        """Build BAGEL-style position_ids: row * max_position_size + col.
+
+        Returns:
+            position_ids: [B, grid_h * grid_w] long tensor
+        """
+        rows = torch.arange(grid_h, dtype=torch.long).view(grid_h, 1)
+        cols = torch.arange(grid_w, dtype=torch.long).view(1, grid_w)
+        ids = (rows * self.max_num_patch_per_side + cols).reshape(-1)
+        return ids.unsqueeze(0).expand(batch_size, -1)
+
+    def forward(self, position_ids: Tensor) -> Tensor:
+        """Index into pos_embed table.
+
+        Args:
+            position_ids: [B, S] long tensor
+
+        Returns:
+            pos_embed: [B, S, hidden_size]
+        """
+        return self.pos_embed[position_ids]
+
+    @staticmethod
+    def _build_2d_sincos(embed_dim: int, grid_size: int) -> Tensor:
+        """Build 2D sine/cosine table: [grid_size^2, embed_dim].
+
+        Uses BAGEL convention: sin then cos per axis, concat [x, y].
+        """
+        assert embed_dim % 2 == 0
+        half = embed_dim // 2
+        pair_count = half // 2
+
+        # Geometric frequency schedule
+        steps = torch.arange(pair_count, dtype=torch.float64)
+        frequencies = torch.pow(
+            torch.tensor(10000.0, dtype=torch.float64), -steps / pair_count
+        )
+
+        # Grid positions
+        axis = torch.arange(grid_size, dtype=torch.float64)
+        y_positions, x_positions = torch.meshgrid(axis, axis, indexing="ij")
+
+        # Encode each axis: [grid_size^2, half]
+        def encode(positions: Tensor) -> Tensor:
+            phases = positions.reshape(-1, 1) * frequencies.reshape(1, -1)
+            return torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
+
+        x_features = encode(x_positions)
+        y_features = encode(y_positions)
+        return torch.cat([x_features, y_features], dim=1).float()
+
+
 class ContinuousTokenProjector(nn.Module):
     """Projects continuous-valued tokens into model hidden dimension.
 
