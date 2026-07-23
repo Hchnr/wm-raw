@@ -89,6 +89,11 @@ def main() -> None:
     tc.log_every = int(train_cfg.get("log_every", 10))
     tc.output_dir = train_cfg.get("output_dir", "outputs/wm-raw")
 
+    # Fixed sequence length (for CUDA Graph / static compilation)
+    fixed_seqlen_cfg = train_cfg.get("fixed_seqlen", {})
+    if fixed_seqlen_cfg.get("enabled"):
+        tc.condition_max_seq_len = int(fixed_seqlen_cfg.get("condition_max_seq_len", 256))
+
     # Multitask
     mt_cfg = raw_config.get("multitask", {})
     tc.vlm_microbatches = int(mt_cfg.get("vlm_microbatches_per_step", 0))

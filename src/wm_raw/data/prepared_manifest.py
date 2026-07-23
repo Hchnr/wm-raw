@@ -77,6 +77,11 @@ def load_dataset_info(prepared_root: Path) -> DatasetInfo:
 def load_shard_records(prepared_root: Path) -> tuple[ShardRecord, ...]:
     """Load shard records from shards.jsonl."""
     shards_path = Path(prepared_root) / "shards.jsonl"
+    if not shards_path.is_file():
+        raise FileNotFoundError(
+            f"shards.jsonl not found at: {shards_path}\n"
+            f"Ensure prepared_root points to a valid wm_sequence_prepared directory."
+        )
     records: list[ShardRecord] = []
     with shards_path.open("r", encoding="utf-8") as f:
         for line in f:

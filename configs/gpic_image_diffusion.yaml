@@ -74,6 +74,11 @@ training:
   max_steps: 200000
   log_every: 10
   output_dir: outputs/gpic_image_diffusion
+  # Fixed sequence length for static compilation / CUDA Graph
+  fixed_seqlen:
+    enabled: true
+    # P99.9=220, aligned to 64 -> 256. Truncates only 0.03% of samples.
+    condition_max_seq_len: 256
 
 checkpoint:
   save_every_steps: 5000
@@ -87,4 +92,4 @@ logging:
   wandb_enabled: true
   wandb_project: wm-raw
   wandb_entity: hechenrui123-beijing-academy-of-artificial-intelligence
-  wandb_name: gpic-patchlatent-adaln-fm-shift2-200k
+  wandb_name: gpic-patchlatent-adaln-fm-shift2-200k-pytorch

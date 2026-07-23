@@ -102,6 +102,7 @@ class TrainingConfig:
     condition_prefix: str = "Caption: "
     condition_suffix: str = " <|wm_predict_image|>"
     text_condition_dropout_prob: float = 0.0
+    condition_max_seq_len: int | None = None  # Fixed length for CUDA Graph compatibility
 
     # Trainable mode
     train_diffusion_backbone: bool = True
@@ -670,6 +671,7 @@ def run_training(config: TrainingConfig) -> None:
         condition_prefix=config.condition_prefix,
         condition_suffix=config.condition_suffix,
         text_condition_dropout_prob=config.text_condition_dropout_prob,
+        condition_max_seq_len=config.condition_max_seq_len,
     )
     dataloader = DataLoader(
         dataset,
