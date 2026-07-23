@@ -647,8 +647,12 @@ def run_training(config: TrainingConfig) -> None:
     compute_dtype = getattr(torch, config.compute_dtype, torch.bfloat16)
 
     # Build model
+    if ctx.is_main:
+        logger.info("Building model...")
     model_config = WorldModelConfig()  # Use defaults (4B VLM + 2B diffusion)
     model = WorldModel(model_config)
+    if ctx.is_main:
+        logger.info("Model built")
 
     # Detect if resume_from is an online (wm-training) DCP checkpoint
     _is_online_resume = False
@@ -664,23 +668,31 @@ def run_training(config: TrainingConfig) -> None:
     # Load pretrained weights (skip if resuming from online DCP — it already has them)
     if not _is_online_resume:
         if config.vlm_path and not config.skip_pretrained:
+            if ctx.is_main:
+                logger.info("Loading VLM weights from %s ...", config.vlm_path)
             from .checkpoint import load_vlm_weights
             report = load_vlm_weights(model, config.vlm_path, dtype=compute_dtype)
             if ctx.is_main:
                 logger.info(report.format())
 
         if config.diffusion_path and not config.skip_pretrained:
+            if ctx.is_main:
+                logger.info("Loading diffusion weights from %s ...", config.diffusion_path)
             from .checkpoint import load_diffusion_weights
             report = load_diffusion_weights(model, config.diffusion_path, dtype=compute_dtype)
             if ctx.is_main:
                 logger.info(report.format())
     else:
         # Load from online DCP (before FSDP wrapping, model weights only)
+        if ctx.is_main:
+            logger.info("Loading online DCP checkpoint from %s ...", config.resume_from)
         from .checkpoint import load_online_dcp_weights
         report = load_online_dcp_weights(model, config.resume_from, dtype=compute_dtype)
         if ctx.is_main:
             logger.info(report.format())
 
+    if ctx.is_main:
+        logger.info("Moving model to device %s ...", ctx.device)
     model = model.to(device=ctx.device, dtype=compute_dtype)
 
     # Configure trainable parameters
@@ -688,6 +700,8 @@ def run_training(config: TrainingConfig) -> None:
 
     # FSDP2
     if config.fsdp2_enabled and ctx.world_size > 1:
+        if ctx.is_main:
+            logger.info("Applying FSDP2...")
         model = apply_fsdp2(model, ctx=ctx)
 
     # torch.compile
