@@ -20,7 +20,7 @@ Usage (our own DCP checkpoint):
 
 Usage (online DCP checkpoint, comparable to interactive_generate_image.py):
     CUDA_VISIBLE_DEVICES=1 python scripts/generate_image.py \
-        --checkpoint /share/project/eai_pwm/repos/wm-training/outputs/.../step_095000.dcp \
+        --checkpoint /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp/checkpoints/step_285000.dcp \
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
@@ -241,11 +241,14 @@ def encode_text_condition(
     position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
 
     # Build causal attention mask [B, 1, S, S]
-    # Causal: lower-triangular, masked where padding
-    causal = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=dtype))
-    # Apply padding mask: zero out columns for padding tokens
-    pad_mask = attention_mask_1d.unsqueeze(1).unsqueeze(2).to(dtype)  # [B, 1, 1, S]
-    attn_mask = causal.unsqueeze(0) * pad_mask  # [B, 1, S, S]
+    # SDPA interprets float mask as additive: 0 = attend, -inf = mask out
+    causal = torch.triu(
+        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
+        diagonal=1,
+    )  # upper triangle = -inf (future tokens masked), diagonal and below = 0
+    # Apply padding mask: -inf for padding token columns
+    pad_mask = (1 - attention_mask_1d.float()).unsqueeze(1).unsqueeze(2) * float("-inf")
+    attn_mask = causal.unsqueeze(0) + pad_mask  # [B, 1, S, S]
 
     # Run VLM forward (no images, text-only)
     with torch.inference_mode(), torch.amp.autocast(device.type, dtype=dtype):
