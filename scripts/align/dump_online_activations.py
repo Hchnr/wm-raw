@@ -167,7 +167,7 @@ def load_dcp_checkpoint(model: Any, checkpoint_path: str) -> None:
         allow_partial_dcp_load=False,
         use_ema=False,
     )
-    n_loaded = len(report.loaded_keys) if hasattr(report, "loaded_keys") else "unknown"
+    n_loaded = report.loaded_keys if hasattr(report, "loaded_keys") else "unknown"
     n_missing = len(report.missing_keys) if hasattr(report, "missing_keys") else "unknown"
     print(f"  Loaded: {n_loaded} keys, Missing: {n_missing} keys")
 
@@ -406,7 +406,7 @@ class OnlineActivationCapture:
         )
 
         # --- Cross-attention adapters ---
-        xattn_adapters = model.cross_attention.adapters.get("state", None)
+        xattn_adapters = model.cross_attention.adapters["state"] if "state" in model.cross_attention.adapters else None
         if xattn_adapters is not None:
             for i, adapter in enumerate(xattn_adapters):
                 self._hooks.append(
