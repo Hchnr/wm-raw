@@ -285,8 +285,8 @@ def encode_with_vae(
     # Patchify: [B, H*W, C] → [B, (H/P)*(W/P), P*P*C]
     from wm_training.models.qwen3vl_bagel.image_latent import patchify_image_latent_tokens
 
-    state_target = patchify_image_latent_tokens(
-        tokens, latent_h=latent_h, latent_w=latent_w, patch_size=patch_size,
+    state_target, patched_shape = patchify_image_latent_tokens(
+        torch, tokens, latent_shape=latent_shape, patch_size=patch_size,
     )
     print(f"  Patchified state_target: {state_target.shape}")
     return state_target, latent_h, latent_w
