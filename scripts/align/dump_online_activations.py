@@ -264,8 +264,8 @@ def encode_with_vae(
     from wm_training.models.qwen3vl_bagel.latent_codec import FrozenImageLatentCodec
 
     print(f"  Loading VAE: {vae_path}")
-    codec = FrozenImageLatentCodec.from_config(
-        model_path=vae_path,
+    codec = FrozenImageLatentCodec.from_pretrained(
+        vae_path,
         device=device,
         dtype=torch.bfloat16,
     )
