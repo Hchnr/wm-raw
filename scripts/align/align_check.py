@@ -256,7 +256,7 @@ def cmd_smoke(args: argparse.Namespace) -> None:
 
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
-        load_checkpoint(model, args.checkpoint)
+        load_checkpoint(args.checkpoint, model)
 
     model.eval()
 
@@ -296,7 +296,7 @@ def cmd_replay(args: argparse.Namespace) -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-    from wm_raw.checkpoint import load_checkpoint
+    from wm_raw.checkpoint import load_online_dcp_weights
     from wm_raw.config import WorldModelConfig
     from wm_raw.models import WorldModel
 
@@ -333,7 +333,7 @@ def cmd_replay(args: argparse.Namespace) -> None:
     checkpoint_path = args.checkpoint or meta.get("checkpoint", "")
     if checkpoint_path:
         print(f"Loading checkpoint: {checkpoint_path}")
-        load_checkpoint(model, checkpoint_path)
+        load_online_dcp_weights(model, checkpoint_path)
     else:
         print("WARNING: No checkpoint specified, using random weights")
 
@@ -351,17 +351,23 @@ def cmd_replay(args: argparse.Namespace) -> None:
     patch_w = lat_w // 2
 
     condition_input_ids = fixture["condition_input_ids"].to(device)
-    condition_attention_mask = fixture["condition_attention_mask"].to(device)
+    condition_attention_mask_raw = fixture["condition_attention_mask"].to(device)
 
-    # Build proper 4D causal mask if attention_mask is 2D [B, S]
-    if condition_attention_mask.ndim == 2:
-        S = condition_attention_mask.shape[1]
-        causal = torch.triu(
-            torch.full((S, S), float("-inf"), device=device), diagonal=1
-        )
-        # Mask out padding positions
-        pad_mask = (1 - condition_attention_mask.float()).unsqueeze(1).unsqueeze(2) * float("-inf")
-        condition_attention_mask = causal.unsqueeze(0) + pad_mask
+    # Build proper 4D attention mask [B, 1, S, S] for VLM
+    # Conditioning uses bidirectional (non-causal) attention.
+    # If all tokens are valid (no padding), pass None for full attention.
+    if condition_attention_mask_raw.ndim == 2:
+        B, S = condition_attention_mask_raw.shape
+        if condition_attention_mask_raw.all():
+            # No padding — full bidirectional attention
+            condition_attention_mask = None
+        else:
+            # Mask out padding key positions: [B, 1, 1, S] → broadcast to [B, 1, S, S]
+            mask_4d = torch.zeros(B, 1, S, S, device=device, dtype=dtype)
+            pad_cols = (1 - condition_attention_mask_raw.float()).unsqueeze(1).unsqueeze(2) * torch.finfo(dtype).min
+            condition_attention_mask = mask_4d + pad_cols
+    else:
+        condition_attention_mask = condition_attention_mask_raw
 
     # Position IDs [3, B, S] — simple sequential
     B, S = condition_input_ids.shape
