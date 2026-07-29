@@ -95,21 +95,27 @@ def main():
     print("[wm-training] Building model and running forward...")
     print("=" * 70)
 
+    from wm_raw.utils.timing import Timer
+
     from wm_training.models.qwen3vl_bagel.modeling import Qwen3VLBagelModel
     from wm_training.models.qwen3vl_bagel.configuration import Qwen3VLBagelConfig
     from wm_training.inference.checkpoint_loader import load_model_weights
     from transformers import AutoConfig
     import yaml
 
+    timer_online = Timer()
+
     config_path = "/share/project/eai_pwm/home/hcr/repos/wm-training/configs_cuihu/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp.yaml"
     with open(config_path) as f:
         train_config = yaml.safe_load(f)
 
     model_cfg = train_config["model"]
-    vlm_hf_config = AutoConfig.from_pretrained(args.vlm_path, trust_remote_code=True)
-    diffusion_hf_config = AutoConfig.from_pretrained(
-        model_cfg["diffusion_path"], trust_remote_code=True
-    )
+
+    with timer_online.stage("load HF configs"):
+        vlm_hf_config = AutoConfig.from_pretrained(args.vlm_path, trust_remote_code=True)
+        diffusion_hf_config = AutoConfig.from_pretrained(
+            model_cfg["diffusion_path"], trust_remote_code=True
+        )
 
     bagel_config = Qwen3VLBagelConfig.from_mapping({
         "architecture": "qwen3vl_bagel",
@@ -136,16 +142,23 @@ def main():
     }).with_hf_layouts(vlm_config=vlm_hf_config, diffusion_config=diffusion_hf_config)
     bagel_config.validate()
 
-    online_model = Qwen3VLBagelModel(bagel_config)
-    online_model.vlm_branch.load_backbone()
-    online_model.state_diffusion_branch.load_backbone()
+    with timer_online.stage("construct Qwen3VLBagelModel"):
+        online_model = Qwen3VLBagelModel(bagel_config)
 
-    # Load checkpoint
-    print("  Loading .pt checkpoint...")
-    load_model_weights(online_model, args.checkpoint, strict=False)
-    online_model = online_model.to(device=device, dtype=dtype)
-    online_model.eval()
-    print("  Online model ready.")
+    with timer_online.stage("load VLM backbone"):
+        online_model.vlm_branch.load_backbone()
+
+    with timer_online.stage("load diffusion backbone"):
+        online_model.state_diffusion_branch.load_backbone()
+
+    with timer_online.stage("load .pt checkpoint"):
+        load_model_weights(online_model, args.checkpoint, strict=False)
+
+    with timer_online.stage("model to device"):
+        online_model = online_model.to(device=device, dtype=dtype)
+        online_model.eval()
+
+    timer_online.summary()
 
     # VLM forward
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
@@ -223,33 +236,43 @@ def main():
     from wm_raw.config import WorldModelConfig
     from wm_raw.models.model import WorldModel
 
-    config = WorldModelConfig()
-    raw_model = WorldModel(config)
+    timer_raw = Timer()
+
+    with timer_raw.stage("construct WorldModel"):
+        config = WorldModelConfig()
+        raw_model = WorldModel(config)
 
     # Load .pt checkpoint
     from wm_raw.checkpoint import _map_online_key
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    state_dict = ckpt["model"]
+
+    with timer_raw.stage("torch.load .pt file"):
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        state_dict = ckpt["model"]
 
     # Load VLM from pretrained
     from wm_raw.checkpoint import load_vlm_weights
-    load_vlm_weights(raw_model, args.vlm_path)
+    with timer_raw.stage("load VLM weights"):
+        load_vlm_weights(raw_model, args.vlm_path)
 
     # Load diffusion+CA from .pt
-    model_sd = raw_model.state_dict()
-    remapped = {}
-    for key, tensor in state_dict.items():
-        mapped = _map_online_key(f"model.{key}")
-        if mapped is None:
-            continue
-        stripped = mapped[len("model."):] if mapped.startswith("model.") else mapped
-        if stripped in model_sd and tensor.shape == model_sd[stripped].shape:
-            remapped[stripped] = tensor
-    raw_model.load_state_dict(remapped, strict=False)
-    print(f"  Loaded {len(remapped)} params")
+    with timer_raw.stage("remap + load diffusion/CA weights"):
+        model_sd = raw_model.state_dict()
+        remapped = {}
+        for key, tensor in state_dict.items():
+            mapped = _map_online_key(f"model.{key}")
+            if mapped is None:
+                continue
+            stripped = mapped[len("model."):] if mapped.startswith("model.") else mapped
+            if stripped in model_sd and tensor.shape == model_sd[stripped].shape:
+                remapped[stripped] = tensor
+        raw_model.load_state_dict(remapped, strict=False)
+        print(f"  Loaded {len(remapped)} params")
 
-    raw_model = raw_model.to(device=device, dtype=dtype)
-    raw_model.eval()
+    with timer_raw.stage("model to device"):
+        raw_model = raw_model.to(device=device, dtype=dtype)
+        raw_model.eval()
+
+    timer_raw.summary()
 
     # VLM forward — build same mask as generate_image.py
     causal = torch.triu(
