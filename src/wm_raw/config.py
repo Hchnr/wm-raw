@@ -58,18 +58,58 @@ class CrossAttentionConfig:
 
 
 @dataclass(frozen=True)
-class LatentConfig:
-    """Image latent tokenization settings."""
+class TimestepSamplingConfig:
+    """Timestep sampling strategy for flow matching training."""
 
-    # VAE latent shape: [C, H, W] for 256x256 images with BAGEL AE (downsample 8x)
+    type: str = "logit_normal"  # "logit_normal" | "uniform"
+    mean: float = 0.0
+    std: float = 1.0
+
+
+@dataclass(frozen=True)
+class LatentConfig:
+    """Image latent tokenization settings.
+
+    Supports variable latent sizes (resolution buckets). The actual H/W is
+    determined at forward time from the input tensor shape, not hardcoded here.
+    max_position_size must be large enough to cover the largest bucket.
+    """
+
+    # VAE latent channels (BAGEL AE: 16 channels, downsample 8x)
     latent_channels: int = 16
-    latent_height: int = 32
-    latent_width: int = 32
-    # Patchify: 2x2 patches → 256 tokens of dim 64
-    # num_tokens = (H/P)*(W/P) = 256, token_dim = P*P*C = 64
+    vae_downsample_factor: int = 8
+    # Patchify: token_dim = P*P*C = 2*2*16 = 64
     patch_size: int = 2
     position_embedding: str = "bagel_2d_sincos"
-    max_position_size: int = 64
+    max_position_size: int = 64  # max latent grid side (covers 512px / 8 / 2 = 32)
+
+    # Timestep
+    timestep_sampling: TimestepSamplingConfig = field(
+        default_factory=TimestepSamplingConfig
+    )
+    timestep_shift: float = 1.0
+    timestep_conditioning: str = "adaln_zero"  # "adaln_zero" | "input_add"
+
+    @property
+    def token_dim(self) -> int:
+        """Dimension of each patchified latent token: P*P*C."""
+        return self.patch_size ** 2 * self.latent_channels
+
+    def latent_shape_for_image(self, height: int, width: int) -> tuple[int, int]:
+        """Compute latent grid (H_lat, W_lat) for a given image size."""
+        h_lat = height // self.vae_downsample_factor
+        w_lat = width // self.vae_downsample_factor
+        return h_lat, w_lat
+
+    def patch_shape_for_image(self, height: int, width: int) -> tuple[int, int]:
+        """Compute patch grid (H_patch, W_patch) for a given image size."""
+        h_lat, w_lat = self.latent_shape_for_image(height, width)
+        return h_lat // self.patch_size, w_lat // self.patch_size
+
+    def num_tokens_for_image(self, height: int, width: int) -> int:
+        """Number of diffusion tokens for a given image size."""
+        ph, pw = self.patch_shape_for_image(height, width)
+        return ph * pw
 
 
 @dataclass(frozen=True)
@@ -89,7 +129,7 @@ class DiffusionConfig:
 
     # Diffusion objective
     prediction_type: str = "flow"  # flow matching velocity prediction
-    timestep_shift: float = 2.0
+    timestep_shift: float = 1.0
     timestep_frequency_dim: int = 256
 
     # Target (state_target_dim: patchified latent token dim = P*P*C = 2*2*16 = 64)
@@ -133,3 +173,9 @@ class WorldModelConfig:
             raise ValueError("wm-raw only supports flow matching prediction type")
         if self.latent.patch_size < 1:
             raise ValueError("latent patch_size must be >= 1")
+        supported_ts_cond = ("adaln_zero", "input_add")
+        if self.latent.timestep_conditioning not in supported_ts_cond:
+            raise ValueError(
+                f"timestep_conditioning must be one of {supported_ts_cond}, "
+                f"got {self.latent.timestep_conditioning!r}"
+            )

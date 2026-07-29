@@ -44,10 +44,10 @@ class WorldModelOutput:
 class WorldModel(nn.Module):
     """World Model: VLM backbone + state diffusion branch + cross-attention.
 
-    Training workflow:
-        1. VLM branch processes text + image → hidden states + AR loss
+    Training workflow (diffusion-only mode, matching online config):
+        1. VLM branch processes condition text → hidden states (no AR loss)
         2. Diffusion branch denoises latent tokens conditioned on VLM hidden
-        3. Total loss = ar_loss_weight * ar_loss + diffusion_loss_weight * diff_loss
+        3. Total loss = state_diffusion_loss_weight * diff_loss
     """
 
     def __init__(self, config: WorldModelConfig) -> None:
@@ -108,41 +108,54 @@ class WorldModel(nn.Module):
 
     def forward_diffusion(
         self,
-        state_target: Tensor,  # [B, H*W, C] raw VAE latents
+        state_target: Tensor,  # [B, C, H_lat, W_lat] or [B, H*W, C] raw VAE latents
         vlm_hidden_states: list[Tensor],  # from VLM forward
+        latent_h: int,  # latent height (before patchify)
+        latent_w: int,  # latent width (before patchify)
         timesteps: Optional[Tensor] = None,  # [B] optional pre-sampled
         noise: Optional[Tensor] = None,  # [B, num_tokens, token_dim] optional
         loss_mask: Optional[Tensor] = None,  # [B, num_tokens]
-        cross_attention_mask: Optional[Tensor] = None,  # [B, 1, S_diff, S_vlm]
+        cross_attention_mask: Optional[Tensor] = None,
     ) -> DiffusionOutput:
         """Run diffusion forward pass with flow matching.
 
         Steps:
             1. Patchify latent target
-            2. Sample timesteps and noise
-            3. Create noisy input
+            2. Sample timesteps (logit-normal) and noise
+            3. Create noisy input via linear interpolation
             4. Run diffusion backbone with cross-attention
             5. Compute flow matching loss
         """
         batch = state_target.shape[0]
         device = state_target.device
         latent_cfg = self.config.latent
+        patch_size = latent_cfg.patch_size
+
+        # Patch grid dimensions
+        patch_h = latent_h // patch_size
+        patch_w = latent_w // patch_size
 
         # 1. Patchify: [B, H*W, C] → [B, num_patches, patch_dim]
         clean_tokens = patchify_latent(
             state_target,
-            height=latent_cfg.latent_height,
-            width=latent_cfg.latent_width,
-            patch_size=latent_cfg.patch_size,
-        )  # [B, num_tokens, token_dim]
+            height=latent_h,
+            width=latent_w,
+            patch_size=patch_size,
+        )  # [B, patch_h*patch_w, token_dim]
 
         num_tokens = clean_tokens.shape[1]
         token_dim = clean_tokens.shape[2]
 
         # 2. Sample timesteps and noise
         if timesteps is None:
+            ts_cfg = latent_cfg.timestep_sampling
             timesteps = sample_timesteps(
-                batch, device=device, shift=self.config.diffusion.timestep_shift
+                batch,
+                device=device,
+                sampling_type=ts_cfg.type,
+                shift=latent_cfg.timestep_shift,
+                mean=ts_cfg.mean,
+                std=ts_cfg.std,
             )
         if noise is None:
             noise = torch.randn_like(clean_tokens)
@@ -155,6 +168,8 @@ class WorldModel(nn.Module):
         prediction = self.state_diffusion(
             noisy_latent=noisy_tokens,
             timesteps=timesteps,
+            patch_h=patch_h,
+            patch_w=patch_w,
             cross_attention_stack=self.cross_attention,
             vlm_hidden_states=vlm_hidden_states,
             cross_attention_mask=cross_attention_mask,
@@ -165,59 +180,6 @@ class WorldModel(nn.Module):
 
         return DiffusionOutput(loss=loss, prediction=prediction)
 
-    def forward_joint(
-        self,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        position_ids: Tensor,
-        state_target: Tensor,
-        pixel_values: Optional[Tensor] = None,
-        image_grid_thw: Optional[Tensor] = None,
-        image_token_mask: Optional[Tensor] = None,
-        labels: Optional[Tensor] = None,
-        timesteps: Optional[Tensor] = None,
-        noise: Optional[Tensor] = None,
-        loss_mask: Optional[Tensor] = None,
-        cross_attention_mask: Optional[Tensor] = None,
-    ) -> WorldModelOutput:
-        """Joint VLM + Diffusion forward (convenience API).
-
-        Runs VLM forward (with optional AR loss), then diffusion conditioned
-        on VLM hidden states. Returns combined weighted loss.
-        """
-        vlm_out = self.forward_vlm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            image_token_mask=image_token_mask,
-            labels=labels,
-        )
-
-        diff_out = self.forward_diffusion(
-            state_target=state_target,
-            vlm_hidden_states=vlm_out.hidden_states,
-            timesteps=timesteps,
-            noise=noise,
-            loss_mask=loss_mask,
-            cross_attention_mask=cross_attention_mask,
-        )
-
-        ar_loss = vlm_out.ar_loss
-        diff_loss = diff_out.loss
-        total_loss = torch.tensor(0.0, device=diff_loss.device)
-        if ar_loss is not None:
-            total_loss = total_loss + self.config.ar_loss_weight * ar_loss
-        total_loss = total_loss + self.config.state_diffusion_loss_weight * diff_loss
-
-        return WorldModelOutput(
-            loss=total_loss,
-            ar_loss=ar_loss,
-            diffusion_loss=diff_loss,
-            metadata={"task_type": "joint"},
-        )
-
     def forward(
         self,
         batch: dict,
@@ -227,15 +189,13 @@ class WorldModel(nn.Module):
         Expected batch keys:
             task_type: "vlm" | "diffusion" | "joint"
 
-            For VLM:
-                input_ids, attention_mask, position_ids, pixel_values,
-                image_grid_thw, image_token_mask, labels
-
-            For diffusion:
+            For diffusion (primary mode):
                 condition.{input_ids, attention_mask, position_ids, ...}
-                state_target, [timesteps, noise, loss_mask]
+                state_target: [B, H*W, C] VAE encoded latents
+                latent_h, latent_w: latent spatial dimensions
+                [timesteps, noise, loss_mask] — optional, will be sampled if absent
         """
-        task_type = batch.get("task_type", "joint")
+        task_type = batch.get("task_type", "diffusion")
 
         if task_type == "vlm":
             vlm_out = self.forward_vlm(
@@ -270,6 +230,8 @@ class WorldModel(nn.Module):
             diff_out = self.forward_diffusion(
                 state_target=batch["state_target"],
                 vlm_hidden_states=vlm_out.hidden_states,
+                latent_h=batch["latent_h"],
+                latent_w=batch["latent_w"],
                 timesteps=batch.get("timesteps"),
                 noise=batch.get("noise"),
                 loss_mask=batch.get("loss_mask"),
@@ -283,29 +245,28 @@ class WorldModel(nn.Module):
             )
 
         else:  # joint
-            # VLM pass with AR loss
-            vlm_batch = batch.get("vlm", batch.get("condition", {}))
+            cond = batch.get("vlm", batch.get("condition", {}))
             vlm_out = self.forward_vlm(
-                input_ids=vlm_batch["input_ids"],
-                attention_mask=vlm_batch["attention_mask"],
-                position_ids=vlm_batch["position_ids"],
-                pixel_values=vlm_batch.get("pixel_values"),
-                image_grid_thw=vlm_batch.get("image_grid_thw"),
-                image_token_mask=vlm_batch.get("image_token_mask"),
-                labels=vlm_batch.get("labels"),
+                input_ids=cond["input_ids"],
+                attention_mask=cond["attention_mask"],
+                position_ids=cond["position_ids"],
+                pixel_values=cond.get("pixel_values"),
+                image_grid_thw=cond.get("image_grid_thw"),
+                image_token_mask=cond.get("image_token_mask"),
+                labels=cond.get("labels"),
             )
 
-            # Diffusion pass
             diff_out = self.forward_diffusion(
                 state_target=batch["state_target"],
                 vlm_hidden_states=vlm_out.hidden_states,
+                latent_h=batch["latent_h"],
+                latent_w=batch["latent_w"],
                 timesteps=batch.get("timesteps"),
                 noise=batch.get("noise"),
                 loss_mask=batch.get("loss_mask"),
                 cross_attention_mask=batch.get("cross_attention_mask"),
             )
 
-            # Weighted loss
             ar_loss = vlm_out.ar_loss
             diff_loss = diff_out.loss
             total_loss = torch.tensor(0.0, device=diff_loss.device)
