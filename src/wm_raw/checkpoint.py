@@ -535,6 +535,26 @@ _ONLINE_PREFIX_MAP = [
     ("model.cross_attention.adapters.action.", None),
 ]
 
+# Sub-key renames within diffusion branch modules.
+# Online wm-training uses different internal naming than wm-raw.
+_DIFFUSION_SUFFIX_RENAMES: dict[str, str] = {
+    # input_projector: online uses linear_1 (SinusoidalTimestepEmbedding naming)
+    # wm-raw ContinuousTokenProjector uses .proj (nn.Linear)
+    "linear_1.weight": "proj.weight",
+    "linear_1.bias": "proj.bias",
+    # latent_position_embedding: online uses position_embedding
+    # wm-raw BagelGridPositionEmbedding uses pos_embed
+    "position_embedding": "pos_embed",
+}
+
+# time_embedder sub-key renames: online uses linear_1/linear_2, wm-raw uses mlp.0/mlp.2
+_TIME_EMBEDDER_SUFFIX_RENAMES: dict[str, str] = {
+    "linear_1.weight": "mlp.0.weight",
+    "linear_1.bias": "mlp.0.bias",
+    "linear_2.weight": "mlp.2.weight",
+    "linear_2.bias": "mlp.2.bias",
+}
+
 
 def _map_online_key(key: str) -> str | None:
     """Map an online (wm-training) DCP key to wm-raw key.
@@ -570,6 +590,27 @@ def _map_online_key(key: str) -> str | None:
             for old, new in _VISION_MERGER_RENAMES.items():
                 if old in suffix:
                     suffix = suffix.replace(old, new)
+                    break
+
+        # Diffusion input_projector: linear_1 → proj
+        if online_prefix == "model.state_diffusion_branch.input_projector.":
+            for old, new in _DIFFUSION_SUFFIX_RENAMES.items():
+                if suffix == old:
+                    suffix = new
+                    break
+
+        # Diffusion time_embedder: linear_1/linear_2 → mlp.0/mlp.2
+        if online_prefix == "model.state_diffusion_branch.time_embedder.":
+            for old, new in _TIME_EMBEDDER_SUFFIX_RENAMES.items():
+                if suffix == old:
+                    suffix = new
+                    break
+
+        # Diffusion latent_position_embedding: position_embedding → pos_embed
+        if online_prefix == "model.state_diffusion_branch.latent_position_embedding.":
+            for old, new in _DIFFUSION_SUFFIX_RENAMES.items():
+                if suffix == old:
+                    suffix = new
                     break
 
         return raw_prefix + suffix
