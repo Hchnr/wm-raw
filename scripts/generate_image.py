@@ -245,10 +245,16 @@ def encode_text_condition(
     causal = torch.triu(
         torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
         diagonal=1,
-    )  # upper triangle = -inf (future tokens masked), diagonal and below = 0
-    # Apply padding mask: -inf for padding token columns
-    pad_mask = (1 - attention_mask_1d.float()).unsqueeze(1).unsqueeze(2) * float("-inf")
-    attn_mask = causal.unsqueeze(0) + pad_mask  # [B, 1, S, S]
+    )  # upper triangle = -inf, diagonal and below = 0
+    attn_mask = causal.unsqueeze(0).expand(batch_size, -1, -1).unsqueeze(1)  # [B, 1, S, S]
+
+    # Apply padding mask: set columns of padding tokens to -inf
+    # Use where() to avoid 0 * -inf = NaN
+    pad_positions = (attention_mask_1d == 0)  # [B, S] — True for padding
+    if pad_positions.any():
+        # Expand to [B, 1, 1, S] and fill -inf where padding
+        pad_mask = pad_positions.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+        attn_mask = attn_mask.masked_fill(pad_mask, float("-inf"))
 
     # Run VLM forward (no images, text-only)
     with torch.inference_mode(), torch.amp.autocast(device.type, dtype=dtype):
