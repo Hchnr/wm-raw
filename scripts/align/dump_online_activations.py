@@ -197,12 +197,14 @@ def load_gpic_sample(
 
     print(f"Loading GPIC sample from: {prepared_root}")
 
-    # Load dataset
+    # Load dataset (skip shard validation — hashing 55k shards is very slow)
     dataset = PreparedImageCaptionDataset(
         prepared_root=prepared_root,
         image_size=target_height,
         center_crop=False,
         max_read_retries=3,
+        validate=False,
+        max_samples=1,
     )
     print(f"  Dataset size: {len(dataset)}")
 
@@ -231,12 +233,12 @@ def load_gpic_sample(
     )
 
     # Override example metadata with target resolution
-    if example.metadata is None:
-        example = example._replace(metadata={})
-    meta = dict(example.metadata)
+    from dataclasses import replace as _dc_replace
+
+    meta = dict(example.metadata) if example.metadata else {}
     meta["target_height"] = target_height
     meta["target_width"] = target_width
-    example = example._replace(metadata=meta)
+    example = _dc_replace(example, metadata=meta)
 
     # Collate single sample
     batch = collator([example])
