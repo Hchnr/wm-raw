@@ -34,7 +34,7 @@ class RMSNorm(nn.Module):
         x = x.float()
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(input_dtype)
+        return self.weight * x.to(input_dtype)
 
 
 class TextAttention(nn.Module):
