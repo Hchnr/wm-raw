@@ -14,7 +14,8 @@ Usage (our own DCP checkpoint):
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --num-steps 50 --timestep-shift 2.0 --cfg-scale 5.0 --seed 42 \
+        --num-steps 50 --timestep-shift 1.0 --cfg-scale 5.0 --seed 42 \
+        --image-height 512 --image-width 512 \
         --output generated.png --device cuda
 
 Usage (online DCP checkpoint, comparable to interactive_generate_image.py):
@@ -23,7 +24,8 @@ Usage (online DCP checkpoint, comparable to interactive_generate_image.py):
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --num-steps 50 --timestep-shift 2.0 --cfg-scale 5.0 --seed 42 \
+        --num-steps 50 --timestep-shift 1.0 --cfg-scale 5.0 --seed 42 \
+        --image-height 512 --image-width 512 \
         --output generated.png --device cuda
 """
 
@@ -267,6 +269,8 @@ def predict_velocity(
     timesteps: Tensor,  # [B]
     vlm_hidden_states: list[Tensor],
     *,
+    patch_h: int,
+    patch_w: int,
     cross_attention_mask: Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
     device_type: str = "cuda",
@@ -276,6 +280,8 @@ def predict_velocity(
         return model.state_diffusion(
             noisy_latent=noisy_tokens,
             timesteps=timesteps,
+            patch_h=patch_h,
+            patch_w=patch_w,
             cross_attention_stack=model.cross_attention,
             vlm_hidden_states=vlm_hidden_states,
             cross_attention_mask=cross_attention_mask,
@@ -294,6 +300,8 @@ def predict_guided_velocity(
     cond_hidden_states: list[Tensor],
     uncond_hidden_states: list[Tensor] | None,
     *,
+    patch_h: int,
+    patch_w: int,
     cfg_scale: float = 1.0,
     dtype: torch.dtype = torch.bfloat16,
     device_type: str = "cuda",
@@ -301,6 +309,7 @@ def predict_guided_velocity(
     """Velocity prediction with optional classifier-free guidance."""
     cond_vel = predict_velocity(
         model, noisy_tokens, timesteps, cond_hidden_states,
+        patch_h=patch_h, patch_w=patch_w,
         dtype=dtype, device_type=device_type,
     )
 
@@ -309,6 +318,7 @@ def predict_guided_velocity(
 
     uncond_vel = predict_velocity(
         model, noisy_tokens, timesteps, uncond_hidden_states,
+        patch_h=patch_h, patch_w=patch_w,
         dtype=dtype, device_type=device_type,
     )
     return uncond_vel + cfg_scale * (cond_vel - uncond_vel)
@@ -326,14 +336,20 @@ def sample_euler(
     uncond_hidden_states: list[Tensor] | None,
     *,
     num_steps: int = 50,
-    timestep_shift: float = 2.0,
+    timestep_shift: float = 1.0,
     cfg_scale: float = 5.0,
     seed: int = 42,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
     config: WorldModelConfig,
+    image_height: int = 512,
+    image_width: int = 512,
 ) -> Tensor:
     """Generate latent tokens via Euler sampling of the flow model.
+
+    Args:
+        image_height/width: target image resolution (must match training buckets).
+            Default 512x512 matches the primary training bucket.
 
     Returns:
         clean_tokens: [1, num_tokens, token_dim] denoised latent tokens
@@ -341,10 +357,16 @@ def sample_euler(
     latent_cfg = config.latent
     diff_cfg = config.diffusion
 
-    num_tokens = (latent_cfg.latent_height // latent_cfg.patch_size) * (
-        latent_cfg.latent_width // latent_cfg.patch_size
-    )
-    token_dim = diff_cfg.target_dim
+    # Compute latent and patch dimensions from target image size
+    patch_h, patch_w = latent_cfg.patch_shape_for_image(image_height, image_width)
+    num_tokens = patch_h * patch_w
+    token_dim = latent_cfg.token_dim
+
+    logger.info("  Image %dx%d → latent %dx%d → patch %dx%d → %d tokens (dim=%d)",
+                image_height, image_width,
+                image_height // latent_cfg.vae_downsample_factor,
+                image_width // latent_cfg.vae_downsample_factor,
+                patch_h, patch_w, num_tokens, token_dim)
 
     # Generate noise in float32 for numerical stability
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -370,6 +392,8 @@ def sample_euler(
             timestep,
             cond_hidden_states,
             uncond_hidden_states,
+            patch_h=patch_h,
+            patch_w=patch_w,
             cfg_scale=cfg_scale,
             dtype=dtype,
             device_type=device_type,
@@ -394,27 +418,32 @@ def decode_latent_to_image(
     latent_tokens: Tensor,  # [1, num_tokens, token_dim]
     vae,
     config: WorldModelConfig,
+    image_height: int = 512,
+    image_width: int = 512,
 ) -> Image.Image:
     """Unpatchify latent tokens and decode via VAE to PIL image."""
     latent_cfg = config.latent
 
-    # Unpatchify: [1, 256, 64] → [1, 1024, 16]
+    latent_h = image_height // latent_cfg.vae_downsample_factor
+    latent_w = image_width // latent_cfg.vae_downsample_factor
+
+    # Unpatchify: [1, num_patches, patch_dim] → [1, H*W, C]
     flat_latent = unpatchify_latent(
         latent_tokens,
-        height=latent_cfg.latent_height,
-        width=latent_cfg.latent_width,
+        height=latent_h,
+        width=latent_w,
         channels=latent_cfg.latent_channels,
         patch_size=latent_cfg.patch_size,
-    )  # [1, H*W, C] = [1, 1024, 16]
+    )  # [1, H*W, C]
 
     # Reshape to spatial: [1, C, H, W]
     b = flat_latent.shape[0]
     spatial = flat_latent.reshape(
         b,
-        latent_cfg.latent_height,
-        latent_cfg.latent_width,
+        latent_h,
+        latent_w,
         latent_cfg.latent_channels,
-    ).permute(0, 3, 1, 2)  # [1, 16, 32, 32]
+    ).permute(0, 3, 1, 2)  # [1, C, latent_h, latent_w]
 
     # VAE decode
     spatial = spatial.to(dtype=next(vae.parameters()).dtype)
@@ -450,12 +479,17 @@ def main():
     parser.add_argument("--condition-suffix", type=str, default=" <|wm_predict_image|>",
                         help="Suffix appended to prompt (must match training format)")
     parser.add_argument("--num-steps", type=int, default=50, help="Euler sampling steps")
-    parser.add_argument("--timestep-shift", type=float, default=2.0, help="Flow timestep shift")
+    parser.add_argument("--timestep-shift", type=float, default=1.0,
+                        help="Flow timestep shift (must match training: 1.0)")
     parser.add_argument("--cfg-scale", type=float, default=5.0, help="CFG scale (1.0 = no CFG)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default="generated.png", help="Output image path")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--num-images", type=int, default=1, help="Number of images to generate")
+    parser.add_argument("--image-height", type=int, default=512,
+                        help="Target image height (must match training bucket)")
+    parser.add_argument("--image-width", type=int, default=512,
+                        help="Target image width (must match training bucket)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -542,12 +576,18 @@ def main():
             device=device,
             dtype=dtype,
             config=config,
+            image_height=args.image_height,
+            image_width=args.image_width,
         )
         t_sample = time.time() - t0
         logger.info("Sampling took %.1fs", t_sample)
 
         # 8. Decode to image
-        image = decode_latent_to_image(latent_tokens, vae, config)
+        image = decode_latent_to_image(
+            latent_tokens, vae, config,
+            image_height=args.image_height,
+            image_width=args.image_width,
+        )
 
         # Save
         if args.num_images > 1:
