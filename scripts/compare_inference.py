@@ -274,9 +274,11 @@ def main():
 
     timer_raw.summary()
 
-    # VLM forward — build same mask as generate_image.py
+    # VLM forward — build causal mask matching HF transformers convention
+    # HF uses finfo(dtype).min instead of -inf for masked positions
+    min_val = torch.finfo(dtype).min
     causal = torch.triu(
-        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype), diagonal=1
+        torch.full((seq_len, seq_len), min_val, device=device, dtype=dtype), diagonal=1
     )
     attn_mask = causal.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
@@ -304,11 +306,9 @@ def main():
         batch = hidden_raw.shape[0]
         num_tok = hidden_raw.shape[1]
 
-        # Build MRoPE position ids (2D spatial)
-        row_ids = torch.arange(patch_h, device=device, dtype=torch.long).repeat_interleave(patch_w)
-        col_ids = torch.arange(patch_w, device=device, dtype=torch.long).repeat(patch_h)
-        temporal_ids = torch.zeros(num_tok, device=device, dtype=torch.long)
-        mrope_pos_ids = torch.stack([temporal_ids, row_ids, col_ids], dim=0).unsqueeze(1).expand(-1, batch, -1)
+        # Build MRoPE position ids (sequential, same as online)
+        pos_ids = torch.arange(num_tok, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+        mrope_pos_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)
         cos, sin = raw_model.state_diffusion.rotary_emb(mrope_pos_ids)
 
         all_ext_kv = raw_model.cross_attention.project_all_context_kv(
