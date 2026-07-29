@@ -257,13 +257,17 @@ class StateDiffusionBranch(nn.Module):
         hidden, time_hidden = self.prepare_inputs(noisy_latent, timesteps, patch_h, patch_w)
         batch, num_tokens, _ = hidden.shape
 
-        # Build position IDs for MRoPE (simple 1D positions for latent tokens)
-        # Use same position ID for all 3 axes (no temporal/spatial distinction in latent)
-        pos_ids = torch.arange(
-            num_tokens, device=hidden.device, dtype=torch.long
-        ).unsqueeze(0).expand(batch, -1)  # [B, S]
-        # Expand to [3, B, S] for MRoPE
-        position_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
+        # Build 2D spatial MRoPE position IDs for latent tokens: [3, B, num_tokens]
+        # Axis 0 (temporal): all 0  (no video, single frame)
+        # Axis 1 (height):   row index of each patch, repeated patch_w times per row
+        # Axis 2 (width):    col index of each patch, cycling 0..patch_w-1 per row
+        # This matches online: make_image_grid_position_ids_from_latent_shape
+        device = hidden.device
+        row_ids = torch.arange(patch_h, device=device, dtype=torch.long).repeat_interleave(patch_w)  # [num_tokens]
+        col_ids = torch.arange(patch_w, device=device, dtype=torch.long).repeat(patch_h)              # [num_tokens]
+        temporal_ids = torch.zeros(num_tokens, device=device, dtype=torch.long)
+        # Stack to [3, num_tokens] and expand batch dim → [3, B, num_tokens]
+        position_ids = torch.stack([temporal_ids, row_ids, col_ids], dim=0).unsqueeze(1).expand(-1, batch, -1)
         cos, sin = self.rotary_emb(position_ids)
 
         # Build combined attention mask for cross_kv_concat
