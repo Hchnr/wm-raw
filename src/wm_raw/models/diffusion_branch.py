@@ -270,13 +270,13 @@ class StateDiffusionBranch(nn.Module):
         cos, sin = self.rotary_emb(position_ids)
 
         # Build combined attention mask for cross_kv_concat.
-        # Online model builds a 3D all-zeros mask [B, S_q, S_ext+S_self].
-        # IMPORTANT: must be 3D (not 4D [B,1,S,K+S]) to match SDPA kernel path.
+        # Online model builds a 4D all-zeros mask [B, 1, S_q, S_ext+S_self].
+        # Must use 4D to match SDPA kernel dispatch for exact numerical alignment.
         combined_mask = attention_mask
         if combined_mask is None and cross_attention_stack is not None and vlm_hidden_states is not None:
             vlm_seq_len = vlm_hidden_states[0].shape[1]
             combined_mask = torch.zeros(
-                batch, num_tokens, vlm_seq_len + num_tokens,
+                batch, 1, num_tokens, vlm_seq_len + num_tokens,
                 device=hidden.device, dtype=hidden.dtype,
             )
 
