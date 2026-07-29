@@ -122,9 +122,12 @@ class TextAttention(nn.Module):
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
         # Scaled dot-product attention
+        # Use is_causal=True when no explicit mask and no external KV (VLM causal path)
+        use_causal = attention_mask is None and external_kv is None
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attention_mask,
+            is_causal=use_causal,
             scale=self.scaling,
         )  # [B, H, S, D]
 

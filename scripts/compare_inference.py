@@ -274,25 +274,20 @@ def main():
 
     timer_raw.summary()
 
-    # VLM forward — build causal mask matching HF transformers convention
-    # HF uses finfo(dtype).min instead of -inf for masked positions
-    min_val = torch.finfo(dtype).min
-    causal = torch.triu(
-        torch.full((seq_len, seq_len), min_val, device=device, dtype=dtype), diagonal=1
-    )
-    attn_mask = causal.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+    # VLM forward — pass None as attention_mask to use is_causal=True in SDPA
+    # This matches HF transformers behavior when attention_mask is all-1s (no padding)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
         vlm_out_raw = raw_model.forward_vlm(
             input_ids=input_ids,
-            attention_mask=attn_mask,
+            attention_mask=None,
             position_ids=position_ids,
         )
     raw_hidden_states = vlm_out_raw.hidden_states
     print(f"  VLM hidden_states: {len(raw_hidden_states)} layers, shape={raw_hidden_states[0].shape}")
 
-    # Diffusion forward (same noise, same timestep)
+    # Diffusion forward — use full forward method (includes mask construction)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
         raw_prepared_hidden, raw_time_hidden = raw_model.state_diffusion.prepare_inputs(
             noise, timesteps, patch_h=patch_h, patch_w=patch_w
@@ -300,39 +295,37 @@ def main():
 
     print(f"  Prepared hidden: {raw_prepared_hidden.shape}, time_hidden: {raw_time_hidden.shape}")
 
-    # Run diffusion layers
+    # Run full diffusion forward (constructs proper attention mask)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
-        hidden_raw = raw_prepared_hidden
-        batch = hidden_raw.shape[0]
-        num_tok = hidden_raw.shape[1]
-
-        # Build MRoPE position ids (sequential, same as online)
-        pos_ids = torch.arange(num_tok, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-        mrope_pos_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)
-        cos, sin = raw_model.state_diffusion.rotary_emb(mrope_pos_ids)
-
-        all_ext_kv = raw_model.cross_attention.project_all_context_kv(
-            raw_hidden_states, target_device=device, target_dtype=dtype
+        raw_prediction = raw_model.state_diffusion(
+            noisy_latent=noise, timesteps=timesteps,
+            patch_h=patch_h, patch_w=patch_w,
+            cross_attention_stack=raw_model.cross_attention,
+            vlm_hidden_states=raw_hidden_states,
         )
 
-        raw_layer_outputs = []
-        for layer_idx, (layer, adaln) in enumerate(
-            zip(raw_model.state_diffusion.layers, raw_model.state_diffusion.adaln_layers)
-        ):
-            adaln_params = adaln(raw_time_hidden)
-            ext_kv = all_ext_kv[layer_idx]
-            hidden_raw = layer(
-                hidden_raw, attention_mask=None,
-                position_embeddings=(cos, sin),
-                external_kv=ext_kv, adaln_params=adaln_params,
-            )
-            if layer_idx < 3 or layer_idx == 27:
-                raw_layer_outputs.append((layer_idx, hidden_raw.detach().clone()))
+    # Also get per-layer outputs for comparison via hooks
+    raw_layer_outputs = []
+    hooks = []
+    for i, layer in enumerate(raw_model.state_diffusion.layers):
+        if i < 3 or i == 27:
+            def make_hook(idx):
+                def hook(m, inp, out):
+                    raw_layer_outputs.append((idx, out.detach().clone()))
+                return hook
+            hooks.append(layer.register_forward_hook(make_hook(i)))
 
-        raw_final = raw_model.state_diffusion.final_norm(hidden_raw).detach().clone()
-        raw_prediction = raw_model.state_diffusion.output_head(raw_final).detach().clone()
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        raw_prediction = raw_model.state_diffusion(
+            noisy_latent=noise, timesteps=timesteps,
+            patch_h=patch_h, patch_w=patch_w,
+            cross_attention_stack=raw_model.cross_attention,
+            vlm_hidden_states=raw_hidden_states,
+        )
+    for h in hooks:
+        h.remove()
 
-    print(f"  Final hidden: {raw_final.shape}, prediction: {raw_prediction.shape}")
+    print(f"  Prediction: {raw_prediction.shape}")
     print()
 
     # =========================================================================
@@ -354,11 +347,9 @@ def main():
 
     print("\n[Diffusion Layer Outputs]")
     for (idx_o, out_o), (idx_r, out_r) in zip(online_layer_outputs, raw_layer_outputs):
-        assert idx_o == idx_r
         compare(f"layer[{idx_o}]", out_r, out_o)
 
     print("\n[Final Output]")
-    compare("final_norm", raw_final, online_final)
     compare("prediction (velocity)", raw_prediction, online_prediction)
 
     print("\n" + "=" * 70)

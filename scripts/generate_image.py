@@ -297,52 +297,56 @@ def encode_text_condition(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    hf_vlm=None,
 ) -> list[Tensor]:
     """Tokenize a text prompt and run through VLM to get hidden states.
 
+    If hf_vlm is provided, uses the HF Qwen3-VL model directly for exact
+    numerical alignment with online inference. Otherwise uses wm-raw's VLM.
+
     Returns list of hidden states from all VLM layers (for cross-attention).
     """
-    # Tokenize using the processor's tokenizer
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    encoded = tokenizer(
-        [prompt],
-        padding=True,
-        return_tensors="pt",
-    )
+    encoded = tokenizer([prompt], padding=True, return_tensors="pt")
     input_ids = encoded["input_ids"].to(device)
-    attention_mask_1d = encoded["attention_mask"].to(device)  # [B, S]
+    attention_mask_1d = encoded["attention_mask"].to(device)
 
+    if hf_vlm is not None:
+        # Use HF model directly — produces bit-exact hidden states
+        with torch.inference_mode(), torch.amp.autocast(device.type, dtype=dtype):
+            output = hf_vlm(
+                input_ids=input_ids,
+                attention_mask=attention_mask_1d,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        # HF output.hidden_states is tuple of (num_layers+1) tensors
+        return list(output.hidden_states)
+
+    # Fallback: use wm-raw's VLM (may have minor numerical differences)
     seq_len = input_ids.shape[1]
     batch_size = input_ids.shape[0]
 
-    # Build 3D MRoPE position_ids [3, B, S] — all axes use sequential positions
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
+    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-    # Build causal attention mask [B, 1, S, S]
-    # SDPA interprets float mask as additive: 0 = attend, -inf = mask out
     causal = torch.triu(
         torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
         diagonal=1,
-    )  # upper triangle = -inf, diagonal and below = 0
-    attn_mask = causal.unsqueeze(0).expand(batch_size, -1, -1).unsqueeze(1)  # [B, 1, S, S]
+    )
+    attn_mask = causal.unsqueeze(0).expand(batch_size, -1, -1).unsqueeze(1)
 
-    # Apply padding mask: set columns of padding tokens to -inf
-    # Use where() to avoid 0 * -inf = NaN
-    pad_positions = (attention_mask_1d == 0)  # [B, S] — True for padding
+    pad_positions = (attention_mask_1d == 0)
     if pad_positions.any():
-        # Expand to [B, 1, 1, S] and fill -inf where padding
-        pad_mask = pad_positions.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+        pad_mask = pad_positions.unsqueeze(1).unsqueeze(2)
         attn_mask = attn_mask.masked_fill(pad_mask, float("-inf"))
 
-    # Run VLM forward (no images, text-only)
     with torch.inference_mode(), torch.amp.autocast(device.type, dtype=dtype):
         vlm_output = model.forward_vlm(
             input_ids=input_ids,
             attention_mask=attn_mask,
             position_ids=position_ids,
         )
-
     return vlm_output.hidden_states
 
 
@@ -672,6 +676,16 @@ def main():
     vae = load_vae(args.vae_path, device=device, dtype=dtype)
     logger.info("  VAE loaded in %.1fs", time.time() - t_step)
 
+    # 4b. Load HF VLM for condition encoding (bit-exact with online)
+    t_step = time.time()
+    logger.info("Loading HF VLM for condition encoding...")
+    from transformers import AutoModelForImageTextToText
+    hf_vlm = AutoModelForImageTextToText.from_pretrained(
+        args.vlm_path, trust_remote_code=True, dtype=dtype,
+    )
+    hf_vlm = hf_vlm.to(device=device).eval()
+    logger.info("  HF VLM loaded in %.1fs", time.time() - t_step)
+
     # 5. Build prompt list (single or batch mode)
     if args.batch:
         prompts_to_run = EVAL_PROMPTS
@@ -697,7 +711,7 @@ def main():
         else:
             neg_text = args.condition_suffix.strip()
         logger.info("Encoding negative condition: %r", neg_text)
-        uncond_hidden = encode_text_condition(model, processor, neg_text, device=device, dtype=dtype)
+        uncond_hidden = encode_text_condition(model, processor, neg_text, device=device, dtype=dtype, hf_vlm=hf_vlm)
         logger.info("  Negative condition encoded in %.1fs", time.time() - t_step)
 
     # 7. Generate
@@ -715,7 +729,7 @@ def main():
         t_step = time.time()
         condition_text = f"{args.condition_prefix}{prompt}{args.condition_suffix}"
         logger.info("[%d/%d] L%s %s (seed=%d)", idx + 1, len(prompts_to_run), level, name, seed)
-        cond_hidden = encode_text_condition(model, processor, condition_text, device=device, dtype=dtype)
+        cond_hidden = encode_text_condition(model, processor, condition_text, device=device, dtype=dtype, hf_vlm=hf_vlm)
 
         for img_idx in range(args.num_images):
             cur_seed = seed + img_idx

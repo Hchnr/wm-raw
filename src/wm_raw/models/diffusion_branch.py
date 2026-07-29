@@ -269,8 +269,18 @@ class StateDiffusionBranch(nn.Module):
         position_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
         cos, sin = self.rotary_emb(position_ids)
 
-        # Build combined attention mask for cross_kv_concat
-        combined_mask = attention_mask  # None = bidirectional (all-to-all)
+        # Build combined attention mask for cross_kv_concat.
+        # Online model builds an explicit all-zeros mask [B, 1, S_q, S_ext+S_self]
+        # when external_kv is present. We must do the same to match SDPA kernel behavior.
+        combined_mask = attention_mask
+        if combined_mask is None and cross_attention_stack is not None and vlm_hidden_states is not None:
+            # Determine external KV length from the first VLM hidden state
+            # that will be used (layer_map[0] + offset)
+            vlm_seq_len = vlm_hidden_states[0].shape[1]
+            combined_mask = torch.zeros(
+                batch, 1, num_tokens, vlm_seq_len + num_tokens,
+                device=hidden.device, dtype=hidden.dtype,
+            )
 
         # Pre-project all VLM context K/V outside the layer loop.
         # This avoids dynamo recompilation per diffusion_layer_idx.
