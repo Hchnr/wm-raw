@@ -181,6 +181,66 @@ def load_online_dcp_for_inference(
             logger.debug("    skipped: %s", s)
 
 
+def load_online_pt_checkpoint(
+    model: WorldModel,
+    pt_path: Path,
+    vlm_path: str,
+    *,
+    dtype: torch.dtype | None = None,
+) -> None:
+    """Load a monolithic .pt checkpoint exported from wm-training.
+
+    Format: {'model': state_dict, 'global_step': int, ...}
+    Keys are like 'state_diffusion_branch.X' (no 'model.' prefix).
+
+    Strategy: load VLM from pretrained, load diffusion+CA from .pt state_dict.
+    """
+    from wm_raw.checkpoint import _map_online_key
+
+    # 1. Load VLM from pretrained
+    logger.info("Loading VLM weights from %s ...", vlm_path)
+    from wm_raw.checkpoint import load_vlm_weights
+    vlm_report = load_vlm_weights(model, vlm_path)
+    logger.info("VLM: %s", vlm_report.format())
+
+    # 2. Load .pt state dict
+    logger.info("Loading .pt checkpoint: %s", pt_path)
+    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state_dict = ckpt["model"]
+        step = ckpt.get("global_step", "?")
+        logger.info("  global_step=%s, keys=%d", step, len(state_dict))
+    else:
+        state_dict = ckpt
+        logger.info("  Raw state_dict, keys=%d", len(state_dict))
+
+    # 3. Remap keys (add 'model.' prefix for _map_online_key compatibility)
+    model_sd = model.state_dict()
+    remapped: dict[str, Tensor] = {}
+    skipped: list[str] = []
+
+    for key, tensor in state_dict.items():
+        mapped = _map_online_key(f"model.{key}")
+        if mapped is None:
+            continue
+        stripped = mapped[len("model."):] if mapped.startswith("model.") else mapped
+        if stripped not in model_sd:
+            skipped.append(stripped)
+            continue
+        if tensor.shape != model_sd[stripped].shape:
+            skipped.append(f"{stripped} (shape mismatch)")
+            continue
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        remapped[stripped] = tensor
+
+    model.load_state_dict(remapped, strict=False)
+    logger.info("  Loaded %d params (skipped %d)", len(remapped), len(skipped))
+    if skipped[:5]:
+        for s in skipped[:5]:
+            logger.debug("    skipped: %s", s)
+
+
 # ---------------------------------------------------------------------------
 # Flow-matching sampling utilities
 # ---------------------------------------------------------------------------
@@ -472,16 +532,42 @@ def decode_latent_to_image(
 
 
 # ---------------------------------------------------------------------------
+# Evaluation prompts (same as wm-training batch_generate_image.py)
+# ---------------------------------------------------------------------------
+
+EVAL_PROMPTS: list[dict[str, str]] = [
+    {"level": "1", "category": "landscape", "name": "simple_natural_landscape",
+     "prompt": "A peaceful lake surrounded by green mountains, clear blue sky, soft sunlight, realistic photography style."},
+    {"level": "2", "category": "landscape", "name": "complex_natural_environment",
+     "prompt": "A vast snowy mountain valley at sunrise, a crystal clear river flowing through the valley, pine forests covering the slopes, golden sunlight reflecting on the snow, ultra realistic landscape photography."},
+    {"level": "3", "category": "landscape", "name": "cinematic_landscape",
+     "prompt": "A cinematic view of an ancient castle on a cliff above the ocean, surrounded by mist and dark clouds, dramatic lighting, waves crashing against the rocks, fantasy movie scene, highly detailed."},
+    {"level": "4", "category": "landscape", "name": "city_architecture_crowd",
+     "prompt": "A futuristic Tokyo street at night, neon signs glowing everywhere, rain-soaked streets reflecting colorful lights, pedestrians walking with umbrellas, cyberpunk atmosphere, cinematic photography, ultra detailed."},
+    {"level": "5", "category": "portrait", "name": "basic_portrait",
+     "prompt": "Portrait of a young woman with long brown hair, wearing a white dress, natural expression, soft studio lighting, realistic photography, high detail."},
+    {"level": "6", "category": "portrait", "name": "portrait_environment_clothing",
+     "prompt": "A detailed portrait of a young Asian woman wearing a traditional red silk dress, standing in an ancient Chinese garden, delicate embroidery patterns on the fabric, natural makeup, soft afternoon sunlight, shallow depth of field, professional photography."},
+    {"level": "7", "category": "portrait", "name": "complex_character_scene",
+     "prompt": "A cinematic portrait of an elderly Japanese craftsman working in a traditional wooden workshop, wearing a worn blue apron, detailed wrinkles on his face, wooden tools and handmade objects around him, warm sunlight coming through the window, emotional storytelling photography, ultra realistic."},
+    {"level": "8", "category": "portrait", "name": "multi_person_group",
+     "prompt": "A group portrait of five people from different generations standing together in a cozy living room, each person has unique facial features and clothing styles, grandmother, parents and children smiling naturally, warm indoor lighting, realistic photography, highly detailed faces, accurate human anatomy."},
+    {"level": "9", "category": "portrait", "name": "extreme_composite_test",
+     "prompt": "A cinematic photo of a young female astronaut exploring an alien planet, wearing a detailed futuristic spacesuit with realistic fabric textures, holding a holographic device, a massive alien city in the background, strange plants and creatures around her, dramatic sunset lighting, reflections on the helmet glass, Hollywood sci-fi movie style, ultra realistic, 8K detail."},
+]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate images from wm-raw checkpoint")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (.pt or .dcp dir)")
     parser.add_argument("--vae-path", type=str, required=True, help="Path to VAE safetensors")
     parser.add_argument("--vlm-path", type=str, required=True, help="Path to Qwen3-VL processor")
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
+    parser.add_argument("--prompt", type=str, default="", help="Text prompt (single-image mode)")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG")
     parser.add_argument("--condition-prefix", type=str, default="Caption: ",
                         help="Prefix prepended to prompt (must match training format)")
@@ -492,13 +578,21 @@ def main():
                         help="Flow timestep shift (must match training: 1.0)")
     parser.add_argument("--cfg-scale", type=float, default=5.0, help="CFG scale (1.0 = no CFG)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output", type=str, default="generated.png", help="Output image path")
+    parser.add_argument("--output", type=str, default="generated.png",
+                        help="Output path (single) or output directory (batch)")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--num-images", type=int, default=1, help="Number of images to generate")
+    parser.add_argument("--num-images", type=int, default=1, help="Number of images per prompt")
     parser.add_argument("--image-height", type=int, default=512,
                         help="Target image height (must match training bucket)")
     parser.add_argument("--image-width", type=int, default=512,
                         help="Target image width (must match training bucket)")
+    # Batch mode
+    parser.add_argument("--batch", action="store_true",
+                        help="Run batch eval with EVAL_PROMPTS (ignores --prompt)")
+    parser.add_argument("--levels", type=str, default="",
+                        help="Comma-separated levels to run in batch mode (e.g. '1,3,9')")
+    parser.add_argument("--seed-stride", type=int, default=1,
+                        help="Seed increment between prompts in batch mode")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -525,25 +619,26 @@ def main():
     model = WorldModel(config)
     logger.info("  Model built in %.1fs", time.time() - t_step)
 
-    # 3. Load checkpoint (.pt or .dcp directory)
+    # 3. Load checkpoint — auto-detect format from path
     t_step = time.time()
     ckpt_path = Path(args.checkpoint)
     logger.info("Loading checkpoint: %s", ckpt_path)
     if ckpt_path.is_dir():
         # DCP directory — check if it's our own format or online format.
-        # Online checkpoint uses 'model.vlm_branch.*', ours uses 'model.vlm.*'.
         from torch.distributed.checkpoint.filesystem import FileSystemReader
         reader = FileSystemReader(str(ckpt_path))
         metadata = reader.read_metadata()
         ckpt_keys = set(metadata.state_dict_metadata.keys())
         is_online = any(k.startswith("model.vlm_branch.") for k in ckpt_keys)
         if not is_online:
-            # Our own FSDP DCP checkpoint
             load_own_dcp_checkpoint(model, ckpt_path)
         else:
-            # Online format DCP — fast path: VLM from pretrained + EMA from DCP
             load_online_dcp_for_inference(model, ckpt_path, args.vlm_path, dtype=dtype)
+    elif ckpt_path.suffix == ".pt":
+        # Monolithic .pt checkpoint from wm-training
+        load_online_pt_checkpoint(model, ckpt_path, args.vlm_path, dtype=dtype)
     else:
+        # Legacy: direct load_checkpoint (safetensors or raw state_dict)
         load_checkpoint(ckpt_path, model)
     logger.info("  Checkpoint loaded in %.1fs", time.time() - t_step)
 
@@ -558,73 +653,95 @@ def main():
     vae = load_vae(args.vae_path, device=device, dtype=dtype)
     logger.info("  VAE loaded in %.1fs", time.time() - t_step)
 
-    # 5. Encode condition (with prefix/suffix matching training format)
-    t_step = time.time()
-    condition_text = f"{args.condition_prefix}{args.prompt}{args.condition_suffix}"
-    logger.info("Encoding condition: %r", condition_text)
-    cond_hidden = encode_text_condition(model, processor, condition_text, device=device, dtype=dtype)
-    logger.info("  Condition encoded in %.1fs", time.time() - t_step)
+    # 5. Build prompt list (single or batch mode)
+    if args.batch:
+        prompts_to_run = EVAL_PROMPTS
+        if args.levels:
+            selected = {l.strip() for l in args.levels.split(",")}
+            prompts_to_run = [p for p in prompts_to_run if p["level"] in selected]
+        if not prompts_to_run:
+            raise SystemExit(f"No prompts matched --levels={args.levels}")
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Batch mode: %d prompts, output_dir=%s", len(prompts_to_run), output_dir)
+    else:
+        if not args.prompt:
+            raise SystemExit("--prompt is required (or use --batch for eval prompts)")
+        prompts_to_run = [{"level": "0", "category": "custom", "name": "custom", "prompt": args.prompt}]
 
-    # 6. Encode negative condition (for CFG)
+    # 6. Encode negative condition (shared across all prompts for CFG)
     uncond_hidden = None
     if args.cfg_scale != 1.0:
         t_step = time.time()
-        # Unconditional: use negative_prompt with prefix/suffix, or sentinel-only
         if args.negative_prompt:
             neg_text = f"{args.condition_prefix}{args.negative_prompt}{args.condition_suffix}"
         else:
-            # Sentinel-only unconditional (matches online pipeline behavior)
             neg_text = args.condition_suffix.strip()
         logger.info("Encoding negative condition: %r", neg_text)
-        uncond_hidden = encode_text_condition(
-            model, processor, neg_text, device=device, dtype=dtype
-        )
+        uncond_hidden = encode_text_condition(model, processor, neg_text, device=device, dtype=dtype)
         logger.info("  Negative condition encoded in %.1fs", time.time() - t_step)
 
     # 7. Generate
     logger.info("Total setup time: %.1fs", time.time() - t_start)
-    output_path = Path(args.output)
-    for i in range(args.num_images):
-        seed = args.seed + i
-        logger.info("Generating image %d/%d (seed=%d, steps=%d, shift=%.1f, cfg=%.1f)",
-                    i + 1, args.num_images, seed, args.num_steps,
-                    args.timestep_shift, args.cfg_scale)
+    generated = 0
+    failed = 0
 
-        t0 = time.time()
-        latent_tokens = sample_euler(
-            model,
-            cond_hidden,
-            uncond_hidden,
-            num_steps=args.num_steps,
-            timestep_shift=args.timestep_shift,
-            cfg_scale=args.cfg_scale,
-            seed=seed,
-            device=device,
-            dtype=dtype,
-            config=config,
-            image_height=args.image_height,
-            image_width=args.image_width,
-        )
-        t_sample = time.time() - t0
-        logger.info("Sampling took %.1fs", t_sample)
+    for idx, entry in enumerate(prompts_to_run):
+        prompt = entry["prompt"]
+        level = entry["level"]
+        name = entry["name"]
+        seed = args.seed + idx * args.seed_stride
 
-        # 8. Decode to image
-        image = decode_latent_to_image(
-            latent_tokens, vae, config,
-            image_height=args.image_height,
-            image_width=args.image_width,
-        )
+        # Encode condition
+        t_step = time.time()
+        condition_text = f"{args.condition_prefix}{prompt}{args.condition_suffix}"
+        logger.info("[%d/%d] L%s %s (seed=%d)", idx + 1, len(prompts_to_run), level, name, seed)
+        cond_hidden = encode_text_condition(model, processor, condition_text, device=device, dtype=dtype)
 
-        # Save
-        if args.num_images > 1:
-            save_path = output_path.with_stem(f"{output_path.stem}_{i:03d}")
-        else:
-            save_path = output_path
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(save_path)
-        logger.info("Saved: %s", save_path)
+        for img_idx in range(args.num_images):
+            cur_seed = seed + img_idx
+            try:
+                t0 = time.time()
+                latent_tokens = sample_euler(
+                    model,
+                    cond_hidden,
+                    uncond_hidden,
+                    num_steps=args.num_steps,
+                    timestep_shift=args.timestep_shift,
+                    cfg_scale=args.cfg_scale,
+                    seed=cur_seed,
+                    device=device,
+                    dtype=dtype,
+                    config=config,
+                    image_height=args.image_height,
+                    image_width=args.image_width,
+                )
+                t_sample = time.time() - t0
 
-    logger.info("Done.")
+                image = decode_latent_to_image(
+                    latent_tokens, vae, config,
+                    image_height=args.image_height,
+                    image_width=args.image_width,
+                )
+
+                # Determine save path
+                if args.batch:
+                    save_path = output_dir / f"L{level}_{name}_seed{cur_seed}.png"
+                elif args.num_images > 1:
+                    save_path = Path(args.output).with_stem(f"{Path(args.output).stem}_{img_idx:03d}")
+                else:
+                    save_path = Path(args.output)
+
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(save_path)
+                logger.info("  Saved: %s (%.1fs)", save_path, t_sample)
+                generated += 1
+
+            except RuntimeError as e:
+                logger.error("  FAILED: %s", e)
+                failed += 1
+
+    logger.info("Done. Generated %d images, %d failed.", generated, failed)
 
 
 if __name__ == "__main__":
