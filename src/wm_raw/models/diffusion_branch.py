@@ -217,10 +217,11 @@ class StateDiffusionBranch(nn.Module):
         pos_embed = self.latent_position_embedding(pos_ids)  # [B, num_tokens, D]
         hidden = hidden + pos_embed.to(hidden.dtype)
 
-        # 3. Timestep conditioning — input_add (broadcast to all tokens)
+        # 3. Timestep conditioning — input_add (only if not using adaln_zero)
         time_hidden = self.time_embedder(timesteps)  # [B, D]
-        time_cond = self.time_conditioner(time_hidden)  # [B, D]
-        hidden = hidden + time_cond.unsqueeze(1)  # [B, num_tokens, D]
+        if self.latent_config.timestep_conditioning == "input_add":
+            time_cond = self.time_conditioner(time_hidden)  # [B, D]
+            hidden = hidden + time_cond.unsqueeze(1)  # [B, num_tokens, D]
 
         return hidden, time_hidden
 
