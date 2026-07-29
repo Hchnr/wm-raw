@@ -510,17 +510,23 @@ def main():
     device = torch.device(args.device)
     dtype = torch.bfloat16
 
+    t_start = time.time()
+
     # 1. Load processor/tokenizer
     logger.info("Loading processor from %s", args.vlm_path)
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.vlm_path, trust_remote_code=True)
+    logger.info("  Processor loaded in %.1fs", time.time() - t_start)
 
     # 2. Build model
+    t_step = time.time()
     logger.info("Building model...")
     config = WorldModelConfig()
     model = WorldModel(config)
+    logger.info("  Model built in %.1fs", time.time() - t_step)
 
     # 3. Load checkpoint (.pt or .dcp directory)
+    t_step = time.time()
     ckpt_path = Path(args.checkpoint)
     logger.info("Loading checkpoint: %s", ckpt_path)
     if ckpt_path.is_dir():
@@ -539,21 +545,30 @@ def main():
             load_online_dcp_for_inference(model, ckpt_path, args.vlm_path, dtype=dtype)
     else:
         load_checkpoint(ckpt_path, model)
+    logger.info("  Checkpoint loaded in %.1fs", time.time() - t_step)
+
+    t_step = time.time()
     model = model.to(device=device, dtype=dtype)
     model.eval()
+    logger.info("  Model to device in %.1fs", time.time() - t_step)
 
     # 4. Load VAE
+    t_step = time.time()
     logger.info("Loading VAE: %s", args.vae_path)
     vae = load_vae(args.vae_path, device=device, dtype=dtype)
+    logger.info("  VAE loaded in %.1fs", time.time() - t_step)
 
     # 5. Encode condition (with prefix/suffix matching training format)
+    t_step = time.time()
     condition_text = f"{args.condition_prefix}{args.prompt}{args.condition_suffix}"
     logger.info("Encoding condition: %r", condition_text)
     cond_hidden = encode_text_condition(model, processor, condition_text, device=device, dtype=dtype)
+    logger.info("  Condition encoded in %.1fs", time.time() - t_step)
 
     # 6. Encode negative condition (for CFG)
     uncond_hidden = None
     if args.cfg_scale != 1.0:
+        t_step = time.time()
         # Unconditional: use negative_prompt with prefix/suffix, or sentinel-only
         if args.negative_prompt:
             neg_text = f"{args.condition_prefix}{args.negative_prompt}{args.condition_suffix}"
@@ -564,8 +579,10 @@ def main():
         uncond_hidden = encode_text_condition(
             model, processor, neg_text, device=device, dtype=dtype
         )
+        logger.info("  Negative condition encoded in %.1fs", time.time() - t_step)
 
     # 7. Generate
+    logger.info("Total setup time: %.1fs", time.time() - t_start)
     output_path = Path(args.output)
     for i in range(args.num_images):
         seed = args.seed + i
