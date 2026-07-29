@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
-"""Text-to-image generation using a wm-raw checkpoint.
+"""Text-to-image generation using wm-raw with wm-training checkpoints.
 
-Loads a trained wm-raw checkpoint (.pt or FSDP DCP directory) and generates
-images via Euler sampling of the flow-matching diffusion model with optional
-classifier-free guidance.
+Supports three checkpoint formats (auto-detected):
+  - .pt monolithic: wm-training rank-0 export (fastest to load)
+  - .dcp directory: wm-training FSDP2 DCP (slow on NFS, ~10min cold)
+  - .dcp (own):     wm-raw's own FSDP DCP format
+
+Supports two modes:
+  - Single prompt: --prompt "..."
+  - Batch eval:    --batch (runs 9 difficulty-graded prompts L1-L9)
 
 Condition format matches training: "Caption: {prompt} <|wm_predict_image|>"
 CFG unconditional uses sentinel-only: "<|wm_predict_image|>"
 
-Usage (our own DCP checkpoint):
-    CUDA_VISIBLE_DEVICES=1 python scripts/generate_image.py \
-        --checkpoint outputs/gpic_image_diffusion/checkpoints/step-000010 \
+Usage (single image, .pt checkpoint — recommended):
+    python scripts/generate_image.py \
+        --checkpoint .../step_295000.pt \
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --num-steps 50 --timestep-shift 1.0 --cfg-scale 5.0 --seed 42 \
-        --image-height 512 --image-width 512 \
-        --output generated.png --device cuda
+        --num-steps 50 --cfg-scale 5.0 --seed 42 \
+        --output generated.png
 
-Usage (online DCP checkpoint, comparable to interactive_generate_image.py):
-    CUDA_VISIBLE_DEVICES=1 python scripts/generate_image.py \
-        --checkpoint /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp/checkpoints/step_285000.dcp \
+Usage (single image, online DCP checkpoint):
+    python scripts/generate_image.py \
+        --checkpoint .../step_285000.dcp \
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --num-steps 50 --timestep-shift 1.0 --cfg-scale 5.0 --seed 42 \
-        --image-height 512 --image-width 512 \
-        --output generated.png --device cuda
+        --num-steps 50 --cfg-scale 5.0 --seed 42 \
+        --output generated.png
+
+Usage (batch eval, all 9 levels):
+    python scripts/generate_image.py \
+        --checkpoint .../step_295000.pt \
+        --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
+        --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
+        --batch --output eval_results/ \
+        --num-steps 50 --cfg-scale 5.0 --seed 1234
+
+Usage (batch eval, specific levels only):
+    python scripts/generate_image.py \
+        --checkpoint .../step_295000.pt \
+        --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
+        --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
+        --batch --levels "1,5,9" --output eval_results/ \
+        --num-steps 50 --cfg-scale 5.0
 """
 
 from __future__ import annotations
