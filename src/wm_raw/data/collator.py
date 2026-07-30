@@ -13,18 +13,21 @@ import torch
 from torch import Tensor
 
 
-def _pil_to_vae_tensor(image: Any, *, image_size: int) -> Tensor:
-    """Convert PIL Image to VAE input tensor: [3, H, W] in [-1, 1]."""
+def _pil_to_vae_tensor(image: Any, *, image_height: int, image_width: int) -> Tensor:
+    """Convert PIL Image to VAE input tensor: [3, H, W] in [-1, 1].
+
+    Resizes to target_height × target_width (may be non-square for buckets).
+    """
     from PIL import Image, ImageOps
 
     image = ImageOps.fit(
         image.convert("RGB"),
-        (image_size, image_size),
+        (image_width, image_height),
         method=Image.Resampling.BICUBIC,
         centering=(0.5, 0.5),
     )
     raw = torch.ByteTensor(torch.ByteStorage.from_buffer(image.tobytes()))
-    raw = raw.view(image_size, image_size, 3).permute(2, 0, 1).float()
+    raw = raw.view(image_height, image_width, 3).permute(2, 0, 1).float()
     return raw.div(127.5).sub(1.0)
 
 
@@ -157,9 +160,20 @@ class DiffusionCollator:
             tok_kwargs["truncation"] = True
         condition = dict(tokenizer(texts, **tok_kwargs))
 
+        # Determine target image size
+        # Resolution buckets: each example has metadata with target_height/target_width
+        # Fixed size: use self.image_size for both dimensions
+        meta = examples[0].get("metadata", {}) if isinstance(examples[0], dict) else {}
+        if "target_height" in meta and "target_width" in meta:
+            image_height = int(meta["target_height"])
+            image_width = int(meta["target_width"])
+        else:
+            image_height = self.image_size
+            image_width = self.image_size
+
         # Prepare VAE pixel values
         vae_pixel_values = torch.stack([
-            _pil_to_vae_tensor(ex["image"], image_size=self.image_size)
+            _pil_to_vae_tensor(ex["image"], image_height=image_height, image_width=image_width)
             for ex in examples
         ])
 
@@ -167,4 +181,6 @@ class DiffusionCollator:
             "condition": condition,
             "vae_pixel_values": vae_pixel_values,
             "condition_dropped_mask": torch.tensor(drop_mask, dtype=torch.bool),
+            "image_height": image_height,
+            "image_width": image_width,
         }

@@ -429,6 +429,24 @@ def train_step(
     vae_pixels = batch["vae_pixel_values"].to(device=device)
     state_target = codec.encode(vae_pixels)  # [B, H*W, C]
 
+    # Derive latent spatial dimensions from VAE output
+    # VAE downsamples by 8x: 512px → 64 latent, 448px → 56, etc.
+    # state_target shape is [B, H*W, C] — we need H and W separately
+    # For fixed image_size: H = W = image_size / 8
+    # For variable (buckets): get from batch metadata
+    if "image_height" in batch and "image_width" in batch:
+        latent_h = batch["image_height"] // 8
+        latent_w = batch["image_width"] // 8
+    else:
+        # Infer from state_target: assume square if not specified
+        num_latent_pixels = state_target.shape[1]
+        latent_side = int(num_latent_pixels ** 0.5)
+        assert latent_side * latent_side == num_latent_pixels, (
+            f"Cannot infer latent dimensions from {num_latent_pixels} pixels. "
+            f"Pass image_height/image_width in batch."
+        )
+        latent_h = latent_w = latent_side
+
     # Condition tokens
     condition = {k: v.to(device=device) for k, v in batch["condition"].items() if torch.is_tensor(v)}
 
@@ -463,6 +481,8 @@ def train_step(
                 "position_ids": position_ids,
             },
             "state_target": state_target.to(dtype=compute_dtype),
+            "latent_h": latent_h,
+            "latent_w": latent_w,
         })
 
     loss = output.diffusion_loss * config.diffusion_loss_weight
