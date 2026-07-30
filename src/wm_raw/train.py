@@ -138,6 +138,7 @@ def main() -> None:
     # Distributed
     dist_cfg = raw_config.get("distributed", {})
     tc.fsdp2_enabled = dist_cfg.get("strategy", "fsdp2") == "fsdp2"
+    tc.hsdp_enabled = bool(dist_cfg.get("hsdp", False))
 
     # torch.compile — check both locations (new: training.torch_compile, old: distributed.compile)
     compile_cfg = train_cfg.get("torch_compile", {})

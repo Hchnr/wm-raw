@@ -84,6 +84,7 @@ class TrainingConfig:
 
     # FSDP2
     fsdp2_enabled: bool = True
+    hsdp_enabled: bool = False  # Hybrid: shard within node, replicate across nodes
 
     # torch.compile
     compile_enabled: bool = False
@@ -136,10 +137,15 @@ class DistContext:
     world_size: int
     local_rank: int
     device: torch.device
+    local_world_size: int = 1  # GPUs per node
 
     @property
     def is_main(self) -> bool:
         return self.rank == 0
+
+    @property
+    def num_nodes(self) -> int:
+        return self.world_size // self.local_world_size
 
 
 def setup_distributed() -> DistContext:
@@ -152,15 +158,19 @@ def setup_distributed() -> DistContext:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         if torch.cuda.is_available():
             torch.cuda.set_device(device)
-        return DistContext(rank=0, world_size=1, local_rank=0, device=device)
+        return DistContext(rank=0, world_size=1, local_rank=0, device=device, local_world_size=1)
 
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
-    return DistContext(rank=rank, world_size=world_size, local_rank=local_rank, device=device)
+    return DistContext(
+        rank=rank, world_size=world_size, local_rank=local_rank,
+        device=device, local_world_size=local_world_size,
+    )
 
 
 def cleanup_distributed() -> None:
@@ -179,6 +189,7 @@ def apply_fsdp2(
     *,
     ctx: DistContext,
     mp_policy: Any | None = None,
+    hsdp: bool = False,
 ) -> WorldModel:
     """Apply FSDP2 per-layer wrapping to WorldModel.
 
@@ -187,6 +198,11 @@ def apply_fsdp2(
     - Each diffusion decoder layer is a shard unit
     - Cross-attention adapters are shard units
     - Root model gets final fully_shard call
+
+    When hsdp=True, uses Hybrid Sharded Data Parallel:
+    - Intra-node: FSDP (shard parameters across GPUs within a node)
+    - Inter-node: replicate (allreduce gradients across nodes)
+    This reduces cross-node communication volume compared to pure FSDP.
     """
     from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 
@@ -196,34 +212,61 @@ def apply_fsdp2(
             reduce_dtype=torch.float32,
         )
 
+    # Build device mesh for HSDP if requested
+    mesh = None
+    if hsdp and ctx.num_nodes > 1:
+        from torch.distributed.device_mesh import init_device_mesh
+        # 2-D mesh: (replicate across nodes, shard within node)
+        mesh = init_device_mesh(
+            "cuda",
+            (ctx.num_nodes, ctx.local_world_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        if ctx.is_main:
+            logger.info(
+                f"HSDP enabled: {ctx.num_nodes} nodes × {ctx.local_world_size} GPUs/node, "
+                f"shard within node, replicate across nodes"
+            )
+
+    # Common kwargs for fully_shard
+    def _shard(module: Any, reshard: bool = True) -> None:
+        kwargs: dict[str, Any] = {
+            "mp_policy": mp_policy,
+            "reshard_after_forward": reshard,
+        }
+        if mesh is not None:
+            kwargs["mesh"] = mesh["shard"]
+        fully_shard(module, **kwargs)
+
     # Shard VLM decoder layers
     for layer in model.vlm.layers:
-        fully_shard(layer, mp_policy=mp_policy, reshard_after_forward=True)
+        _shard(layer)
 
     # Shard VLM vision encoder blocks
     if hasattr(model.vlm, "vision_encoder") and model.vlm.vision_encoder is not None:
         for block in model.vlm.vision_encoder.blocks:
-            fully_shard(block, mp_policy=mp_policy, reshard_after_forward=True)
+            _shard(block)
 
     # Shard VLM branch as a unit (captures embed_tokens, norm, lm_head)
-    fully_shard(model.vlm, mp_policy=mp_policy, reshard_after_forward=True)
+    _shard(model.vlm)
 
     # Shard diffusion decoder layers
     for layer in model.state_diffusion.layers:
-        fully_shard(layer, mp_policy=mp_policy, reshard_after_forward=True)
+        _shard(layer)
 
-    # Shard diffusion branch as a unit (captures input_proj, time_embedder, output_head, etc.)
-    fully_shard(model.state_diffusion, mp_policy=mp_policy, reshard_after_forward=True)
+    # Shard diffusion branch as a unit
+    _shard(model.state_diffusion)
 
     # Shard cross-attention adapters
     for adapter in model.cross_attention.adapters:
-        fully_shard(adapter, mp_policy=mp_policy, reshard_after_forward=True)
+        _shard(adapter)
 
     # Shard cross-attention as a unit
-    fully_shard(model.cross_attention, mp_policy=mp_policy, reshard_after_forward=True)
+    _shard(model.cross_attention)
 
-    # Root model
-    fully_shard(model, mp_policy=mp_policy, reshard_after_forward=False)
+    # Root model (reshard_after_forward=False for root)
+    _shard(model, reshard=False)
+
     return model
 
 
@@ -804,7 +847,7 @@ def run_training(config: TrainingConfig) -> None:
     if config.fsdp2_enabled and ctx.world_size > 1:
         if ctx.is_main:
             logger.info("Applying FSDP2...")
-        model = apply_fsdp2(model, ctx=ctx)
+        model = apply_fsdp2(model, ctx=ctx, hsdp=config.hsdp_enabled)
 
     # torch.compile
     if config.compile_enabled:

@@ -116,6 +116,7 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  # hsdp: true  # Enable for multi-node: shard within node, replicate across nodes
 
 logging:
   wandb_enabled: true
