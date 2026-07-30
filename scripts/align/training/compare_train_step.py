@@ -165,7 +165,7 @@ def main():
         max_position_size=64, device=device
     )
 
-    # Online forward
+    # Online forward — pass fixed noise/timesteps to ensure determinism
     online_batch = {
         "task_type": "diffusion",
         "condition": {"input_ids": input_ids, "attention_mask": attention_mask_1d},
@@ -175,6 +175,8 @@ def main():
         "state_latent_position_ids": state_latent_position_ids,
         "state_loss_weight": 1.0,
         "action_loss_weight": 0.0,
+        "state_timesteps": timesteps,
+        "state_noise": noise,
     }
 
     with torch.amp.autocast("cuda", dtype=dtype):
