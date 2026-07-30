@@ -117,6 +117,7 @@ class TrainingConfig:
     ema_enabled: bool = False
     ema_decay: float = 0.9999
     ema_warmup_steps: int = 0
+    ema_update_every: int = 1
 
     # Dry run (skip pretrained weight loading)
     skip_pretrained: bool = False

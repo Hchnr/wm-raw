@@ -93,12 +93,12 @@ def main() -> None:
     # Optimizer
     opt_cfg = raw_config.get("optimizer", {})
     tc.adapter_lr = float(opt_cfg.get("adapter_learning_rate", 1e-4))
-    tc.diffusion_lr = float(opt_cfg.get("diffusion_learning_rate", 1e-5))
-    tc.vlm_lr = float(opt_cfg.get("vlm_learning_rate", 1e-6))
+    tc.diffusion_lr = float(opt_cfg.get("diffusion_learning_rate", 1e-4))
+    tc.vlm_lr = float(opt_cfg.get("vlm_learning_rate", 0.0))
     tc.weight_decay = float(opt_cfg.get("weight_decay", 0.0))
     tc.adam_beta1 = float(opt_cfg.get("adam_beta1", 0.9))
     tc.adam_beta2 = float(opt_cfg.get("adam_beta2", 0.95))
-    tc.adam_fused = bool(opt_cfg.get("adam_fused", True))
+    tc.adam_fused = bool(opt_cfg.get("fused", True))
     tc.max_grad_norm = float(opt_cfg.get("max_grad_norm", 1.0))
 
     # Scheduler
@@ -138,8 +138,15 @@ def main() -> None:
     # Distributed
     dist_cfg = raw_config.get("distributed", {})
     tc.fsdp2_enabled = dist_cfg.get("strategy", "fsdp2") == "fsdp2"
-    tc.compile_enabled = bool(dist_cfg.get("compile", False))
-    tc.compile_mode = dist_cfg.get("compile_mode", "default")
+
+    # torch.compile — check both locations (new: training.torch_compile, old: distributed.compile)
+    compile_cfg = train_cfg.get("torch_compile", {})
+    if compile_cfg:
+        tc.compile_enabled = bool(compile_cfg.get("enabled", False))
+        tc.compile_mode = compile_cfg.get("mode", "default")
+    else:
+        tc.compile_enabled = bool(dist_cfg.get("compile", False))
+        tc.compile_mode = dist_cfg.get("compile_mode", "default")
 
     # Logging
     log_cfg = raw_config.get("logging", {})
@@ -153,6 +160,7 @@ def main() -> None:
     tc.ema_enabled = bool(ema_cfg.get("enabled", False))
     tc.ema_decay = float(ema_cfg.get("decay", 0.9999))
     tc.ema_warmup_steps = int(ema_cfg.get("warmup_steps", 0))
+    tc.ema_update_every = int(ema_cfg.get("update_every", 1))
 
     # Compute dtype
     tc.compute_dtype = model_cfg.get("torch_dtype", "bfloat16")
