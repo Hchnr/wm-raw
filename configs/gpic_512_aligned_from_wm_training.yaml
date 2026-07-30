@@ -97,9 +97,10 @@ ema:
   update_every: 1
 
 training:
-  max_steps: 800000
-  log_every: 20
-  output_dir: outputs/gpic_512_aligned_resume_from_raw
+  max_steps: 20
+  log_every: 1
+  # output_dir: outputs/gpic_512_aligned
+  output_dir: outputs/gpic_512_aligned_from_wm_training
   torch_compile:
     enabled: true
     backend: inductor
@@ -112,11 +113,11 @@ checkpoint:
   keep_last_n: 2
   save_final: true
   # resume_mode: "auto" (detect), "wm_raw" (own DCP, full restore), "wm_training" (model weights only)
-  resume_mode: wm_raw
-  resume_from: /share/project/eai_pwm/home/hcr/repos/wm-raw/outputs/gpic_512_aligned/checkpoints/step-000010
+  # resume_mode: wm_raw
+  # resume_from: /share/project/eai_pwm/home/hcr/repos/wm-raw/outputs/gpic_512_aligned/checkpoints/step-000020
   # To resume from online checkpoint instead:
-  # resume_mode: wm_training
-  # resume_from: /share/project/eai_pwm/repos/wm-training/outputs/.../step_350000.dcp
+  resume_mode: wm_training
+  resume_from: /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp/checkpoints/step_360000.dcp
 
 distributed:
   strategy: fsdp2
@@ -125,4 +126,4 @@ distributed:
 logging:
   wandb_enabled: true
   wandb_project: wm-raw
-  wandb_name: gpic-512-aligned-from-step350000
+  wandb_name: gpic-512-aligned-from-step360000
