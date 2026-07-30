@@ -51,7 +51,9 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "step": step,
         }
-        dcp.save(state, checkpoint_id=str(checkpoint_dir))
+        from torch.distributed.checkpoint import FileSystemWriter
+        storage_writer = FileSystemWriter(str(checkpoint_dir), thread_count=16)
+        dcp.save(state, storage_writer=storage_writer)
     except (ImportError, RuntimeError, TypeError):
         # Fallback: single-file checkpoint (rank 0)
         if ctx.is_main:
@@ -183,7 +185,7 @@ def load_checkpoint(
 
         try:
             dcp.load(payload, checkpoint_id=str(path))
-        except (RuntimeError, Exception) as e:
+        except BaseException as e:
             if load_optimizer and "Missing key" in str(e):
                 # Optimizer state structure mismatch (e.g. trainable params changed).
                 # Retry with model weights only — optimizer restarts from scratch.
