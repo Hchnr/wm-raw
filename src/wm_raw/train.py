@@ -134,6 +134,7 @@ def main() -> None:
         tc.keep_last_n = int(tc.keep_last_n)
     tc.save_final = bool(ckpt_cfg.get("save_final", True))
     tc.resume_from = args.resume or ckpt_cfg.get("resume_from")
+    tc.resume_mode = ckpt_cfg.get("resume_mode", "auto")
 
     # Distributed
     dist_cfg = raw_config.get("distributed", {})

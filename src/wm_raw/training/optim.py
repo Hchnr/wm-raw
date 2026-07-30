@@ -135,6 +135,13 @@ def configure_trainable(model: WorldModel, config: TrainingConfig) -> None:
                 for p in module.parameters():
                     p.requires_grad = True
 
+        # In cross_kv_concat mode, freeze unused adapter parameters.
+        # Only context_norm, k_proj, v_proj are used; gate, q_proj, o_proj, query_norm are not.
+        for adapter in model.cross_attention.adapters:
+            for name, p in adapter.named_parameters():
+                if name in ("gate", "q_proj.weight", "o_proj.weight", "query_norm.weight"):
+                    p.requires_grad = False
+
         # Optionally train diffusion backbone
         if config.train_diffusion_backbone:
             for p in model.state_diffusion.layers.parameters():

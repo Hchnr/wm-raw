@@ -158,8 +158,6 @@ def load_checkpoint(
         options = StateDictOptions(full_state_dict=False, cpu_offload=True)
 
         # Build target state dicts that DCP can reshard into.
-        # These carry the current FSDP sharding info so DCP knows how to
-        # redistribute tensors from a different world size.
         model_state = get_model_state_dict(model, options=options)
         payload: dict[str, Any] = {"model": model_state}
 

@@ -63,6 +63,9 @@ class TrainingConfig:
     keep_last_n: int | None = None  # Keep only last N checkpoints (None = keep all)
     save_final: bool = True  # Save checkpoint at end of training
     resume_from: str | None = None
+    # Resume mode: "auto" (detect), "wm_raw" (own DCP, restore optimizer+scheduler),
+    # "wm_training" (online DCP, model weights only)
+    resume_mode: str = "auto"
 
     # Logging
     log_every: int = 10

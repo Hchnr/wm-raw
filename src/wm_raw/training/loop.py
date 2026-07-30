@@ -47,16 +47,24 @@ def run_training(config: TrainingConfig) -> None:
     if ctx.is_main:
         logger.info("Model built")
 
-    # Detect if resume_from is an online (wm-training) DCP checkpoint
-    _is_online_resume = False
-    if config.resume_from:
+    # Determine resume mode
+    _resume_mode = config.resume_mode  # "auto", "wm_raw", "wm_training"
+    if config.resume_from and _resume_mode == "auto":
+        # Auto-detect by inspecting DCP metadata keys
         _resume_path = Path(config.resume_from)
         if (_resume_path / ".metadata").exists():
             from torch.distributed.checkpoint import FileSystemReader
             _reader = FileSystemReader(str(_resume_path))
             _meta = _reader.read_metadata()
-            _sample_keys = list(_meta.state_dict_metadata.keys())[:5]
-            _is_online_resume = any("vlm_branch" in k for k in _sample_keys)
+            _sample_keys = list(_meta.state_dict_metadata.keys())[:20]
+            if any("vlm_branch" in k for k in _sample_keys):
+                _resume_mode = "wm_training"
+            else:
+                _resume_mode = "wm_raw"
+        else:
+            _resume_mode = "wm_raw"  # .pt file = own checkpoint
+
+    _is_online_resume = _resume_mode == "wm_training"
 
     # Load pretrained weights (skip if resuming from online DCP — it already has them)
     if not _is_online_resume:
