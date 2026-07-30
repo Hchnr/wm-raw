@@ -133,27 +133,31 @@ class TextMRoPE(nn.Module):
         return cos, sin
 
     def _apply_interleaved_mrope(self, freqs: Tensor) -> Tensor:
-        """Reorganize from [3, B, S, D/2] chunked to interleaved [B, S, D/2].
+        """Reorganize from [3, B, S, D/2] to interleaved [B, S, D/2].
 
-        MRoPE sections define how many frequency pairs each axis controls:
-          mrope_section = [24, 20, 20] means:
-            - temporal: indices 0..23 (24 pairs)
-            - height:   indices 24..43 (20 pairs)
-            - width:    indices 44..63 (20 pairs)
+        HF Qwen3-VL interleave: assigns axes to frequency indices as:
+          index 0,3,6,...  → temporal (axis 0)
+          index 1,4,7,...  → height  (axis 1)
+          index 2,5,8,...  → width   (axis 2)
 
-        The interleaved layout places them as [T,H,W,T,H,W,...,T,T] cycling
-        through axes for spatial locality in attention patterns.
+        Implementation: start with temporal freqs for ALL dims, then overwrite
+        height/width at their interleaved positions.
         """
-        sections = list(self.mrope_section)
-        # Split each axis's frequencies according to section sizes
-        # freqs[axis]: [B, S, D/2], split into chunks per section
-        t_freqs = freqs[0, :, :, : sections[0]]  # [B, S, sec_t]
-        h_freqs = freqs[1, :, :, sections[0] : sections[0] + sections[1]]  # [B, S, sec_h]
-        w_freqs = freqs[2, :, :, sections[0] + sections[1] :]  # [B, S, sec_w]
+        # Start with temporal as base (covers all dims including overflow)
+        result = freqs[0].clone()  # [B, S, D/2]
 
-        # Interleave: cycle through T, H, W in blocks
-        # For Qwen3-VL the interleaving is simply concat in section order
-        # (the actual HF code does a more complex interleave, but the checkpoint
-        # weights are trained with this simple layout)
-        result = torch.cat([t_freqs, h_freqs, w_freqs], dim=-1)  # [B, S, D/2]
+        # Overwrite height dims: indices 1, 4, 7, ... up to mrope_section[1]*3
+        h_length = self.mrope_section[1] * 3
+        h_indices = list(range(1, h_length, 3))
+        for idx in h_indices:
+            if idx < result.shape[-1]:
+                result[..., idx] = freqs[1, ..., idx]
+
+        # Overwrite width dims: indices 2, 5, 8, ... up to mrope_section[2]*3
+        w_length = self.mrope_section[2] * 3
+        w_indices = list(range(2, w_length, 3))
+        for idx in w_indices:
+            if idx < result.shape[-1]:
+                result[..., idx] = freqs[2, ..., idx]
+
         return result

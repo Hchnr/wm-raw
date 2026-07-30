@@ -17,8 +17,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .qwen3vl_backbone import RMSNorm
-
 
 class CrossAttentionAdapter(nn.Module):
     """Single cross-attention layer: diffusion queries attend to VLM context.
@@ -50,9 +48,10 @@ class CrossAttentionAdapter(nn.Module):
         query_width = num_query_heads * head_dim
         kv_width = num_kv_heads * head_dim
 
-        # Norms
-        self.query_norm = RMSNorm(diffusion_hidden_size, eps=norm_eps)
-        self.context_norm = RMSNorm(vlm_hidden_size, eps=norm_eps)
+        # Norms — use nn.RMSNorm (native PyTorch), matching online's cross-attention
+        # which uses nn.RMSNorm, NOT the HF Qwen3VL custom RMSNorm.
+        self.query_norm = nn.RMSNorm(diffusion_hidden_size, eps=norm_eps)
+        self.context_norm = nn.RMSNorm(vlm_hidden_size, eps=norm_eps)
 
         # Projections
         self.q_proj = nn.Linear(diffusion_hidden_size, query_width, bias=False)

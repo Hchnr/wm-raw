@@ -259,14 +259,15 @@ class StateDiffusionBranch(nn.Module):
         batch, num_tokens, _ = hidden.shape
 
         # Build MRoPE position IDs for latent tokens: [3, B, num_tokens]
-        # Online model uses simple sequential positions (arange) for ALL 3 MRoPE axes.
-        # The 2D spatial information is already encoded via BagelGridPositionEmbedding
-        # (additive pos embed in prepare_inputs), so RoPE just provides sequential ordering.
+        # Online uses 2D grid: temporal=0, height=row_idx, width=col_idx
+        # This encodes spatial structure into the rotary embeddings.
         device = hidden.device
-        pos_ids = torch.arange(
-            num_tokens, device=device, dtype=torch.long
-        ).unsqueeze(0).expand(batch, -1)  # [B, S]
-        position_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
+        temporal_ids = torch.zeros(num_tokens, device=device, dtype=torch.long)
+        row_ids = torch.arange(patch_h, device=device, dtype=torch.long).repeat_interleave(patch_w)
+        col_ids = torch.arange(patch_w, device=device, dtype=torch.long).repeat(patch_h)
+        position_ids = torch.stack(
+            [temporal_ids, row_ids, col_ids], dim=0
+        ).unsqueeze(1).expand(-1, batch, -1)  # [3, B, num_tokens]
         cos, sin = self.rotary_emb(position_ids)
 
         # Build combined attention mask for cross_kv_concat.
