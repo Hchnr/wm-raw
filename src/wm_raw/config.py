@@ -42,6 +42,9 @@ class VisionModelConfig:
     out_hidden_size: int = 2560  # projects to text hidden_size via merger
     rope_theta: float = 10000.0
     num_position_embeddings: int = 2304
+    # DeepStack: vision encoder layers whose hidden states are merged and
+    # injected into early language-model decoder layers.
+    deepstack_visual_indexes: tuple[int, ...] = (5, 11, 17)
 
 
 @dataclass(frozen=True)

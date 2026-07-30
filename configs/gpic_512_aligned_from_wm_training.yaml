@@ -1,0 +1,129 @@
+# wm-raw: GPIC image diffusion training — aligned with online production config
+# Source: qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp.yaml
+#
+# Key differences from old config:
+#   - timestep_shift: 2.0 → 1.0
+#   - timestep_sampling: uniform → logit_normal
+#   - image_size: 256 → 512 (resolution buckets)
+#   - max_grad_norm: 5.0 → 1.0
+#   - ema_decay: 0.9995 → 0.9999
+#   - batch_size: 32 → 8 (per GPU, compensated by resolution)
+#   - diffusion_lr: aligned to 1e-4 (same as adapter)
+#
+# Usage:
+#   torchrun --nproc_per_node=2 -m wm_raw.train --config configs/gpic_512_aligned.yaml
+
+model:
+  vlm_path: /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct
+  diffusion_path: /share/project/eai_pwm/models/Qwen3-VL-2B-Instruct
+  torch_dtype: bfloat16
+  communication_policy: cross_kv_concat
+  layer_mapping_policy: middle_n
+  hidden_state_layer_offset: 1
+  cross_attention_gate_init: 0.01
+  latent:
+    objective: flow_matching
+    prediction_type: flow
+    timestep_shift: 1.0
+    timestep_sampling:
+      type: logit_normal
+      mean: 0.0
+      std: 1.0
+    timestep_frequency_dim: 256
+    timestep_conditioning: adaln_zero
+    tokenization: patchified
+    patch_size: 2
+    position_embedding: bagel_2d_sincos
+    max_position_size: 64
+
+vae:
+  model_path: /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors
+  frozen: true
+  image_size: 512
+
+data:
+  dataset_type: wm_sequence_prepared
+  prepared_root: /share/project/eai_pwm/prepared_datasets/gpic_train_v1_94_incremental
+  image_size: 512
+  batch_size: 8
+  num_workers: 8
+  seed: 42
+  shuffle: true
+  condition_prefix: "Caption: "
+  condition_suffix: " <|wm_predict_image|>"
+  text_condition_dropout_prob: 0.1
+  cfg_dropout_mode: sentinel_only
+  center_crop: false
+  # Resolution buckets: same bucket sizes as online
+  resolution_buckets:
+    enabled: true
+    stride: 16
+    sizes:
+      - [512, 512]
+      - [448, 608]
+      - [608, 448]
+      - [416, 640]
+      - [640, 416]
+      - [384, 704]
+      - [704, 384]
+    max_aspect_ratio_error: 0.08
+    max_upscale_ratio: 1.5
+
+multitask:
+  vlm_microbatches_per_step: 0
+  diffusion_microbatches_per_step: 1
+  trainable_mode: diffusion
+  train_diffusion_backbone: true
+  vlm_loss_weight: 0.0
+  state_loss_weight: 1.0
+
+optimizer:
+  adapter_learning_rate: 1.0e-4
+  diffusion_learning_rate: 1.0e-4
+  vlm_learning_rate: 0.0
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+  fused: true
+
+scheduler:
+  type: constant
+  warmup_steps: 2500
+
+ema:
+  enabled: true
+  decay: 0.9999
+  update_every: 1
+
+training:
+  max_steps: 20
+  log_every: 1
+  # output_dir: outputs/gpic_512_aligned
+  output_dir: outputs/gpic_512_aligned_from_wm_training
+  torch_compile:
+    enabled: true
+    backend: inductor
+    mode: default
+    dynamic: false
+    cache_size_limit: 16
+
+checkpoint:
+  save_every_steps: 5000
+  keep_last_n: 2
+  save_final: true
+  # resume_mode: "auto" (detect), "wm_raw" (own DCP, full restore), "wm_training" (model weights only)
+  # resume_mode: wm_raw
+  # resume_from: /share/project/eai_pwm/home/hcr/repos/wm-raw/outputs/gpic_512_aligned/checkpoints/step-000020
+  # To resume from online checkpoint instead:
+  resume_mode: wm_training
+  resume_from: /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp/checkpoints/step_360000.dcp
+
+distributed:
+  strategy: fsdp2
+  # hsdp: true  # Enable for multi-node: shard within node, replicate across nodes
+
+logging:
+  wandb_enabled: true
+  wandb_project: wm-raw
+  wandb_name: gpic-512-aligned-from-step360000
