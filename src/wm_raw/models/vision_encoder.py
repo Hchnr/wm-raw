@@ -211,6 +211,59 @@ class PatchMerger(nn.Module):
         return x
 
 
+class DeepstackMerger(nn.Module):
+    """Deepstack patch merger (post-shuffle norm variant).
+
+    Same spatial merge as PatchMerger but normalizes AFTER the spatial
+    reshape (post-shuffle). Uses HF-compatible parameter naming
+    (linear_fc1/linear_fc2) so checkpoint keys map directly.
+    """
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        spatial_merge_size: int,
+        out_hidden_size: int,
+    ) -> None:
+        super().__init__()
+        self.merge_size = spatial_merge_size
+        merged_dim = vision_hidden_size * (spatial_merge_size**2)
+        # Post-shuffle norm: normalizes the concatenated vector
+        self.norm = nn.LayerNorm(merged_dim, eps=1e-6)
+        self.linear_fc1 = nn.Linear(merged_dim, merged_dim)
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = nn.Linear(merged_dim, out_hidden_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Merge spatial patches with post-shuffle normalization.
+
+        Args:
+            x: [N, D_vision] — N must be divisible by merge_size^2
+
+        Returns:
+            merged: [N // merge_size^2, D_text]
+        """
+        # Reshape first (shuffle), then normalize
+        x = x.view(-1, self.merge_size**2 * x.shape[-1])
+        x = self.norm(x)
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+        return x
+
+
+class VisionEncoderOutput:
+    """Output from VisionEncoder forward pass."""
+
+    __slots__ = ("visual_tokens", "deepstack_features")
+
+    def __init__(
+        self,
+        visual_tokens: Tensor,
+        deepstack_features: list[Tensor],
+    ) -> None:
+        self.visual_tokens = visual_tokens
+        self.deepstack_features = deepstack_features
+
+
 class VisionEncoder(nn.Module):
     """Complete Qwen3-VL vision encoder.
 
@@ -233,10 +286,12 @@ class VisionEncoder(nn.Module):
         out_hidden_size: int = 3584,
         rope_theta: float = 10000.0,
         num_position_embeddings: int = 2304,
+        deepstack_visual_indexes: tuple[int, ...] = (),
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.spatial_merge_size = spatial_merge_size
+        self.deepstack_visual_indexes = deepstack_visual_indexes
         head_dim = hidden_size // num_heads
 
         self.patch_embed = PatchEmbed(
@@ -254,6 +309,12 @@ class VisionEncoder(nn.Module):
         ])
         self.merger = PatchMerger(hidden_size, spatial_merge_size, out_hidden_size)
 
+        # DeepStack mergers: one per deepstack_visual_indexes layer
+        self.deepstack_merger_list = nn.ModuleList([
+            DeepstackMerger(hidden_size, spatial_merge_size, out_hidden_size)
+            for _ in range(len(deepstack_visual_indexes))
+        ])
+
     def forward(
         self,
         pixel_values: Tensor,  # [N, C, T, P, P]
@@ -261,11 +322,13 @@ class VisionEncoder(nn.Module):
         cu_seqlens: Tensor,  # [num_images + 1]
         bilinear_indices: Tensor,  # [N, 4] for position embedding interpolation
         bilinear_weights: Tensor,  # [N, 4]
-    ) -> Tensor:
+    ) -> VisionEncoderOutput:
         """Run vision encoder.
 
         Returns:
-            visual_tokens: [total_merged_tokens, D_text]
+            VisionEncoderOutput with:
+                visual_tokens: [total_merged_tokens, D_text]
+                deepstack_features: list of [total_merged_tokens, D_text], one per deepstack layer
         """
         # Patch embedding
         hidden_states = self.patch_embed(pixel_values)  # [N, D]
@@ -280,10 +343,19 @@ class VisionEncoder(nn.Module):
         emb = torch.cat((rotary_freqs, rotary_freqs), dim=-1)  # [N, head_dim]
         position_embeddings = (emb.cos(), emb.sin())
 
-        # Transformer blocks
-        for block in self.blocks:
+        # Transformer blocks with deepstack feature extraction
+        deepstack_features: list[Tensor] = []
+        for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(hidden_states, position_embeddings, cu_seqlens)
+            if layer_idx in self.deepstack_visual_indexes:
+                merger_idx = self.deepstack_visual_indexes.index(layer_idx)
+                deepstack_features.append(
+                    self.deepstack_merger_list[merger_idx](hidden_states)
+                )
 
         # Patch merger: reduce spatial resolution
         merged = self.merger(hidden_states)  # [N/merge^2, D_text]
-        return merged
+        return VisionEncoderOutput(
+            visual_tokens=merged,
+            deepstack_features=deepstack_features,
+        )

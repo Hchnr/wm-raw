@@ -19,7 +19,7 @@ from torch import Tensor, nn
 from ..config import TextModelConfig, VisionModelConfig
 from .qwen3vl_backbone import DecoderLayer, RMSNorm
 from .rope import TextMRoPE
-from .vision_encoder import VisionEncoder
+from .vision_encoder import VisionEncoder, VisionEncoderOutput
 
 
 class VLMBranch(nn.Module):
@@ -56,6 +56,7 @@ class VLMBranch(nn.Module):
             spatial_merge_size=vision_config.spatial_merge_size,
             out_hidden_size=vision_config.out_hidden_size,
             rope_theta=vision_config.rope_theta,
+            deepstack_visual_indexes=vision_config.deepstack_visual_indexes,
         )
 
         # Text decoder layers
@@ -101,10 +102,13 @@ class VLMBranch(nn.Module):
         hidden_states = self.embed_tokens(input_ids)  # [B, S, D]
 
         # 2. Process and merge visual tokens (if images present)
+        deepstack_features: list[Tensor] = []
         if pixel_values is not None and image_grid_thw is not None:
-            visual_tokens = self.vision_encoder(
+            vision_output: VisionEncoderOutput = self.vision_encoder(
                 pixel_values, image_grid_thw
-            )  # [total_visual_tokens, D]
+            )
+            visual_tokens = vision_output.visual_tokens  # [total_visual_tokens, D]
+            deepstack_features = vision_output.deepstack_features
 
             # Scatter visual tokens into the sequence at image_token positions
             if image_token_mask is not None:
@@ -117,13 +121,19 @@ class VLMBranch(nn.Module):
 
         # 4. Run through decoder layers, collecting hidden states
         all_hidden_states: list[Tensor] = [hidden_states]
+        num_deepstack = len(deepstack_features)
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_embeddings=(cos, sin),
             )
+            # DeepStack: inject visual features into early decoder layers
+            if num_deepstack > 0 and layer_idx < num_deepstack and image_token_mask is not None:
+                hidden_states = self._deepstack_process(
+                    hidden_states, image_token_mask, deepstack_features[layer_idx]
+                )
             all_hidden_states.append(hidden_states)
 
         # 5. Final norm
@@ -175,6 +185,23 @@ class VLMBranch(nn.Module):
         flat_output[visual_positions] = visual_tokens.to(flat_output.dtype)
 
         return flat_output.reshape(batch, seq_len, dim)
+
+    def _deepstack_process(
+        self,
+        hidden_states: Tensor,  # [B, S, D]
+        visual_pos_mask: Tensor,  # [B, S] bool mask for visual token positions
+        visual_embeds: Tensor,  # [total_visual_tokens, D] deepstack feature
+    ) -> Tensor:
+        """Add deepstack visual features to hidden states at visual positions.
+
+        This injects multi-scale vision features from intermediate vision encoder
+        layers into the early language model decoder layers, following the DeepStack
+        paper (https://arxiv.org/abs/2406.04334).
+        """
+        hidden_states = hidden_states.clone()
+        visual_embeds = visual_embeds.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        hidden_states[visual_pos_mask] = hidden_states[visual_pos_mask] + visual_embeds
+        return hidden_states
 
 
 class VLMOutput:
