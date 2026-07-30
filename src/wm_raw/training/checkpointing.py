@@ -125,8 +125,17 @@ def load_checkpoint(
                 if isinstance(md, TensorStorageMetadata):
                     ckpt_model_shapes[stripped] = tuple(md.size)
 
+        # Also check if checkpoint has optimizer state (used later for fallback)
+        ckpt_has_optimizer = any(
+            k.startswith("optimizer.") for k in metadata.state_dict_metadata
+        )
+
         model_sd = model.state_dict()
-        model_keys = set(model_sd.keys())
+        # Strip _orig_mod. prefix added by torch.compile for comparison
+        model_keys = set()
+        _orig_mod_prefix = "_orig_mod."
+        for k in model_sd.keys():
+            model_keys.add(k.removeprefix(_orig_mod_prefix))
 
         missing_keys = sorted(model_keys - ckpt_model_keys)
         unexpected_keys = sorted(ckpt_model_keys - model_keys)
@@ -135,7 +144,9 @@ def load_checkpoint(
 
         for key in sorted(model_keys & ckpt_model_keys):
             if key in ckpt_model_shapes:
-                model_shape = tuple(model_sd[key].shape)
+                # Look up shape using the original key (may have _orig_mod. prefix)
+                sd_key = key if key in model_sd else f"{_orig_mod_prefix}{key}"
+                model_shape = tuple(model_sd[sd_key].shape)
                 if model_shape != ckpt_model_shapes[key]:
                     shape_mismatch.append(
                         f"{key}: model={list(model_shape)} vs ckpt={list(ckpt_model_shapes[key])}"
@@ -161,7 +172,8 @@ def load_checkpoint(
         model_state = get_model_state_dict(model, options=options)
         payload: dict[str, Any] = {"model": model_state}
 
-        if optimizer is not None:
+        load_optimizer = optimizer is not None and ckpt_has_optimizer
+        if load_optimizer:
             optim_state = get_optimizer_state_dict(model, optimizer, options=options)
             payload["optimizer"] = optim_state
 
@@ -169,11 +181,26 @@ def load_checkpoint(
         payload["scheduler"] = {}
         payload["step"] = 0
 
-        dcp.load(payload, checkpoint_id=str(path))
+        try:
+            dcp.load(payload, checkpoint_id=str(path))
+        except (RuntimeError, Exception) as e:
+            if load_optimizer and "Missing key" in str(e):
+                # Optimizer state structure mismatch (e.g. trainable params changed).
+                # Retry with model weights only — optimizer restarts from scratch.
+                logger.warning(
+                    "DCP optimizer state mismatch — loading model weights only "
+                    "(optimizer will restart from scratch). Error: %s", e
+                )
+                model_state = get_model_state_dict(model, options=options)
+                payload = {"model": model_state, "scheduler": {}, "step": 0}
+                dcp.load(payload, checkpoint_id=str(path))
+                load_optimizer = False
+            else:
+                raise
 
         # Apply loaded state back to model/optimizer
         set_model_state_dict(model, payload["model"], options=options)
-        if optimizer is not None and payload.get("optimizer"):
+        if load_optimizer and payload.get("optimizer"):
             set_optimizer_state_dict(
                 model, optimizer, payload["optimizer"], options=options
             )
