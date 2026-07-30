@@ -918,6 +918,7 @@ def run_training(config: TrainingConfig) -> None:
         dataset = ImageCaptionDataset(records)
 
     # Build sampler: bucket sampler if available, otherwise standard distributed
+    sampler: Any = None  # epoch-aware sampler (DistributedSampler or BucketBatchSampler)
     if bucket_sizes is not None and assignment_path is not None:
         batch_sampler = ResolutionBucketBatchSampler(
             assignment_path=assignment_path,
@@ -929,6 +930,7 @@ def run_training(config: TrainingConfig) -> None:
             seed=config.seed,
             shuffle=True,
         )
+        sampler = batch_sampler
         collator = DiffusionCollator(
             processor=processor,
             image_size=config.image_size,
