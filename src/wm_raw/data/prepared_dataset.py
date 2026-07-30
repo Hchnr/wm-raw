@@ -188,12 +188,25 @@ def _extract_image_caption(example: dict[str, Any]) -> tuple[str, str]:
     return caption.strip(), image_uri
 
 
-def _load_pil_image(path: Path, *, image_size: int, center_crop: bool) -> Any:
-    """Load and resize a PIL image."""
+def _load_pil_image(
+    path: Path,
+    *,
+    image_size: int,
+    center_crop: bool,
+    preserve_original_size: bool = False,
+) -> Any:
+    """Load and optionally resize a PIL image.
+
+    When preserve_original_size=True (resolution bucket mode), the image is
+    returned at full resolution — resizing happens later in the collator
+    based on bucket assignment.
+    """
     from PIL import Image, ImageOps
 
     with Image.open(path) as img:
         img = img.convert("RGB")
+        if preserve_original_size:
+            return img.copy()
         if center_crop:
             img = ImageOps.fit(
                 img,
