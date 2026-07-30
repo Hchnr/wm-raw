@@ -19,7 +19,7 @@ Usage (single image, .pt checkpoint — recommended):
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --num-steps 50 --cfg-scale 5.0 --seed 42 \
+        --num-steps 50 --cfg-scale 5.0 --seed 1234 \
         --output generated.png
 
 Usage (single image, online DCP checkpoint):
@@ -28,7 +28,7 @@ Usage (single image, online DCP checkpoint):
         --vae-path /share/project/eai_pwm/models/BAGEL-7B-MoT/ae.safetensors \
         --vlm-path /share/project/eai_pwm/models/Qwen3-VL-4B-Instruct \
         --prompt "a photo of a cat sitting on a windowsill" \
-        --num-steps 50 --cfg-scale 5.0 --seed 42 \
+        --num-steps 50 --cfg-scale 5.0 --seed 1234 \
         --output generated.png
 
 Usage (batch eval, all 9 levels):
@@ -600,7 +600,7 @@ def main():
     parser.add_argument("--timestep-shift", type=float, default=1.0,
                         help="Flow timestep shift (must match training: 1.0)")
     parser.add_argument("--cfg-scale", type=float, default=5.0, help="CFG scale (1.0 = no CFG)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     parser.add_argument("--output", type=str, default="generated.png",
                         help="Output path (single) or output directory (batch)")
     parser.add_argument("--device", type=str, default="cuda", help="Device")

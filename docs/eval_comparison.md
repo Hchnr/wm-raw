@@ -10,7 +10,7 @@
 | 采样器 | Euler, 50 steps | Euler, 50 steps |
 | CFG scale | 5.0 | 5.0 |
 | 图片尺寸 | 512×512 | 512×512 |
-| Seed | 42-50 | 1234-1242 |
+| Seed | 1234-1242 | 1234-1242 |
 | Condition | `Caption: {prompt} <\|wm_predict_image\|>` | 同左 |
 
 ---
@@ -21,7 +21,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L1_simple_natural_landscape_seed42.png) | ![](eval_images/raw_345k/L1_simple_natural_landscape_seed42.png) | ![](eval_images/online_295k/eval_L1_simple_natural_landscape_seed1234.png) | ![](eval_images/online_345k/eval_L1_simple_natural_landscape_seed1234.png) |
+| ![](eval_images/raw_295k/L1_simple_natural_landscape_seed1234.png) | ![](eval_images/raw_345k/L1_simple_natural_landscape_seed1234.png) | ![](eval_images/online_295k/eval_L1_simple_natural_landscape_seed1234.png) | ![](eval_images/online_345k/eval_L1_simple_natural_landscape_seed1234.png) |
 
 ---
 
@@ -31,7 +31,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L2_complex_natural_environment_seed43.png) | ![](eval_images/raw_345k/L2_complex_natural_environment_seed43.png) | ![](eval_images/online_295k/eval_L2_complex_natural_environment_seed1235.png) | ![](eval_images/online_345k/eval_L2_complex_natural_environment_seed1235.png) |
+| ![](eval_images/raw_295k/L2_complex_natural_environment_seed1235.png) | ![](eval_images/raw_345k/L2_complex_natural_environment_seed1235.png) | ![](eval_images/online_295k/eval_L2_complex_natural_environment_seed1235.png) | ![](eval_images/online_345k/eval_L2_complex_natural_environment_seed1235.png) |
 
 ---
 
@@ -41,7 +41,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L3_cinematic_landscape_seed44.png) | ![](eval_images/raw_345k/L3_cinematic_landscape_seed44.png) | ![](eval_images/online_295k/eval_L3_cinematic_landscape_seed1236.png) | ![](eval_images/online_345k/eval_L3_cinematic_landscape_seed1236.png) |
+| ![](eval_images/raw_295k/L3_cinematic_landscape_seed1236.png) | ![](eval_images/raw_345k/L3_cinematic_landscape_seed1236.png) | ![](eval_images/online_295k/eval_L3_cinematic_landscape_seed1236.png) | ![](eval_images/online_345k/eval_L3_cinematic_landscape_seed1236.png) |
 
 ---
 
@@ -51,7 +51,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L4_city_architecture_crowd_seed45.png) | ![](eval_images/raw_345k/L4_city_architecture_crowd_seed45.png) | ![](eval_images/online_295k/eval_L4_city_architecture_crowd_seed1237.png) | ![](eval_images/online_345k/eval_L4_city_architecture_crowd_seed1237.png) |
+| ![](eval_images/raw_295k/L4_city_architecture_crowd_seed1237.png) | ![](eval_images/raw_345k/L4_city_architecture_crowd_seed1237.png) | ![](eval_images/online_295k/eval_L4_city_architecture_crowd_seed1237.png) | ![](eval_images/online_345k/eval_L4_city_architecture_crowd_seed1237.png) |
 
 ---
 
@@ -61,7 +61,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L5_basic_portrait_seed46.png) | ![](eval_images/raw_345k/L5_basic_portrait_seed46.png) | ![](eval_images/online_295k/eval_L5_basic_portrait_seed1238.png) | ![](eval_images/online_345k/eval_L5_basic_portrait_seed1238.png) |
+| ![](eval_images/raw_295k/L5_basic_portrait_seed1238.png) | ![](eval_images/raw_345k/L5_basic_portrait_seed1238.png) | ![](eval_images/online_295k/eval_L5_basic_portrait_seed1238.png) | ![](eval_images/online_345k/eval_L5_basic_portrait_seed1238.png) |
 
 ---
 
@@ -71,7 +71,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L6_portrait_environment_clothing_seed47.png) | ![](eval_images/raw_345k/L6_portrait_environment_clothing_seed47.png) | ![](eval_images/online_295k/eval_L6_portrait_environment_clothing_seed1239.png) | ![](eval_images/online_345k/eval_L6_portrait_environment_clothing_seed1239.png) |
+| ![](eval_images/raw_295k/L6_portrait_environment_clothing_seed1239.png) | ![](eval_images/raw_345k/L6_portrait_environment_clothing_seed1239.png) | ![](eval_images/online_295k/eval_L6_portrait_environment_clothing_seed1239.png) | ![](eval_images/online_345k/eval_L6_portrait_environment_clothing_seed1239.png) |
 
 ---
 
@@ -81,7 +81,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L7_complex_character_scene_seed48.png) | ![](eval_images/raw_345k/L7_complex_character_scene_seed48.png) | ![](eval_images/online_295k/eval_L7_complex_character_scene_seed1240.png) | ![](eval_images/online_345k/eval_L7_complex_character_scene_seed1240.png) |
+| ![](eval_images/raw_295k/L7_complex_character_scene_seed1240.png) | ![](eval_images/raw_345k/L7_complex_character_scene_seed1240.png) | ![](eval_images/online_295k/eval_L7_complex_character_scene_seed1240.png) | ![](eval_images/online_345k/eval_L7_complex_character_scene_seed1240.png) |
 
 ---
 
@@ -91,7 +91,7 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L8_multi_person_group_seed49.png) | ![](eval_images/raw_345k/L8_multi_person_group_seed49.png) | ![](eval_images/online_295k/eval_L8_multi_person_group_seed1241.png) | ![](eval_images/online_345k/eval_L8_multi_person_group_seed1241.png) |
+| ![](eval_images/raw_295k/L8_multi_person_group_seed1241.png) | ![](eval_images/raw_345k/L8_multi_person_group_seed1241.png) | ![](eval_images/online_295k/eval_L8_multi_person_group_seed1241.png) | ![](eval_images/online_345k/eval_L8_multi_person_group_seed1241.png) |
 
 ---
 
@@ -101,4 +101,4 @@
 
 | wm-raw 295k | wm-raw 345k | wm-training 295k | wm-training 345k |
 |:---:|:---:|:---:|:---:|
-| ![](eval_images/raw_295k/L9_extreme_composite_test_seed50.png) | ![](eval_images/raw_345k/L9_extreme_composite_test_seed50.png) | ![](eval_images/online_295k/eval_L9_extreme_composite_test_seed1242.png) | ![](eval_images/online_345k/eval_L9_extreme_composite_test_seed1242.png) |
+| ![](eval_images/raw_295k/L9_extreme_composite_test_seed1242.png) | ![](eval_images/raw_345k/L9_extreme_composite_test_seed1242.png) | ![](eval_images/online_295k/eval_L9_extreme_composite_test_seed1242.png) | ![](eval_images/online_345k/eval_L9_extreme_composite_test_seed1242.png) |
