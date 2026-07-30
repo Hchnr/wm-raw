@@ -104,7 +104,7 @@ checkpoint:
   keep_last_n: 2
   save_final: true
   resume_mode: wm_training
-  resume_from: /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp/checkpoints/step_350000.dcp
+  resume_from: /share/project/eai_pwm/repos/wm-training/outputs/qwen3vl_gpic_patchlatent_2dpos_adaln_fm_logitnormal_buckets_512_stage2_from_step145000_fsdp/checkpoints/step_360000.dcp
 
 distributed:
   strategy: fsdp2
@@ -113,4 +113,4 @@ distributed:
 logging:
   wandb_enabled: true
   wandb_project: wm-raw
-  wandb_name: gpic-512-hsdp-2x8-from-step350000
+  wandb_name: gpic-512-hsdp-2x8-from-step360000
