@@ -23,10 +23,10 @@ class PreparedImageCaptionDataset(Dataset):
     """Map-style dataset over prepared wm_sequence_prepared shards.
 
     Each __getitem__ returns:
-        {"image": PIL.Image (RGB), "caption": str, "image_path": str}
+        {"image": PIL.Image (RGB), "caption": str, "image_path": str, "metadata": dict}
 
-    This matches the interface of ImageCaptionDataset so DiffusionCollator
-    works unchanged.
+    Supports resolution buckets: when accessed with a (index, bucket_id) tuple,
+    returns the image at original size with target_height/target_width in metadata.
     """
 
     def __init__(
@@ -38,6 +38,7 @@ class PreparedImageCaptionDataset(Dataset):
         max_read_retries: int = 3,
         max_samples: int | None = None,
         validate: bool = False,
+        bucket_sizes: list[tuple[int, int]] | None = None,
     ) -> None:
         self.prepared_root = Path(prepared_root).expanduser()
         if not self.prepared_root.is_dir():
@@ -56,6 +57,7 @@ class PreparedImageCaptionDataset(Dataset):
         self.center_crop = center_crop
         self.max_read_retries = max_read_retries
         self.max_samples = max_samples
+        self.bucket_sizes = bucket_sizes  # [(H, W), ...] or None
 
         # Build prefix-sum array for global→(shard, local) mapping
         self._prefix_counts = _build_prefix_counts(self.shards)
@@ -71,7 +73,12 @@ class PreparedImageCaptionDataset(Dataset):
     def __len__(self) -> int:
         return self._total
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int | tuple[int, int]) -> dict[str, Any]:
+        # Support (index, bucket_id) tuple from ResolutionBucketBatchSampler
+        bucket_id: int | None = None
+        if isinstance(index, tuple):
+            index, bucket_id = int(index[0]), int(index[1])
+
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -81,7 +88,7 @@ class PreparedImageCaptionDataset(Dataset):
         for attempt in range(self.max_read_retries + 1):
             candidate = (index + attempt) % self._prefix_counts[-1]
             try:
-                return self._load_example(candidate)
+                return self._load_example(candidate, bucket_id=bucket_id)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt == 0:
@@ -98,7 +105,7 @@ class PreparedImageCaptionDataset(Dataset):
         local_index = index - self._prefix_counts[shard_idx]
         return self.shards[shard_idx], local_index
 
-    def _load_example(self, index: int) -> dict[str, Any]:
+    def _load_example(self, index: int, bucket_id: int | None = None) -> dict[str, Any]:
         """Load a single example by global index."""
         shard, local_index = self._locate(index)
         shard_dir = self.prepared_root / shard.relative_path
@@ -111,13 +118,28 @@ class PreparedImageCaptionDataset(Dataset):
         caption, image_uri = _extract_image_caption(example)
         image_path = shard_dir / image_uri
 
-        # Load and resize PIL image
-        image = _load_pil_image(image_path, image_size=self.image_size, center_crop=self.center_crop)
+        # Load PIL image — preserve original size if using resolution buckets
+        preserve_original = bucket_id is not None
+        image = _load_pil_image(
+            image_path,
+            image_size=self.image_size,
+            center_crop=self.center_crop,
+            preserve_original_size=preserve_original,
+        )
+
+        # Build metadata
+        metadata: dict[str, Any] = {}
+        if bucket_id is not None and self.bucket_sizes is not None:
+            target_height, target_width = self.bucket_sizes[bucket_id]
+            metadata["target_height"] = target_height
+            metadata["target_width"] = target_width
+            metadata["resolution_bucket_id"] = bucket_id
 
         return {
             "image": image,
             "caption": caption,
             "image_path": str(image_path),
+            "metadata": metadata,
         }
 
 

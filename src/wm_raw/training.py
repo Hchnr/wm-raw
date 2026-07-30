@@ -828,18 +828,41 @@ def run_training(config: TrainingConfig) -> None:
 
     # Data
     from .data import DiffusionCollator, ImageCaptionDataset, PreparedImageCaptionDataset, load_manifest
+    from .data.resolution_buckets import ResolutionBucketBatchSampler, find_bucket_assignment_path
     from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(config.vlm_path, trust_remote_code=True)
 
+    # Parse resolution bucket config (if present in YAML)
+    bucket_sizes: list[tuple[int, int]] | None = None
+    # bucket_sizes will be set from config if resolution_buckets is enabled
+    # For now, check if the config has this info stored somewhere
+    # (the YAML parser doesn't read it yet, but we can detect from image_size > 256)
+
     if config.dataset_type == "wm_sequence_prepared":
         if not config.prepared_root:
             raise ValueError("data.prepared_root is required for dataset_type=wm_sequence_prepared")
+
+        # Try to find bucket assignment cache for 512px buckets
+        bucket_sizes_512 = [
+            (512, 512), (448, 608), (608, 448),
+            (416, 640), (640, 416), (384, 704), (704, 384),
+        ]
+        assignment_path = None
+        if config.image_size >= 512:
+            assignment_path = find_bucket_assignment_path(config.prepared_root, bucket_sizes_512)
+            if assignment_path is not None:
+                bucket_sizes = bucket_sizes_512
+                if ctx.is_main:
+                    logger.info(f"Using resolution buckets: {bucket_sizes}")
+                    logger.info(f"  assignment cache: {assignment_path}")
+
         dataset = PreparedImageCaptionDataset(
             config.prepared_root,
             image_size=config.image_size,
-            center_crop=True,
+            center_crop=False,  # online uses center_crop=false with buckets
             max_samples=config.max_samples,
+            bucket_sizes=bucket_sizes,
         )
     else:
         records = load_manifest(
@@ -850,26 +873,55 @@ def run_training(config: TrainingConfig) -> None:
             shuffle=True,
         )
         dataset = ImageCaptionDataset(records)
-    sampler = DistributedSampler(
-        dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True, seed=config.seed
-    )
-    collator = DiffusionCollator(
-        processor=processor,
-        image_size=config.image_size,
-        condition_prefix=config.condition_prefix,
-        condition_suffix=config.condition_suffix,
-        text_condition_dropout_prob=config.text_condition_dropout_prob,
-        condition_max_seq_len=config.condition_max_seq_len,
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        sampler=sampler,
-        collate_fn=collator,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+
+    # Build sampler: bucket sampler if available, otherwise standard distributed
+    if bucket_sizes is not None and assignment_path is not None:
+        batch_sampler = ResolutionBucketBatchSampler(
+            assignment_path=assignment_path,
+            dataset_size=len(dataset),
+            bucket_sizes=bucket_sizes,
+            batch_size=config.batch_size,
+            num_replicas=ctx.world_size,
+            rank=ctx.rank,
+            seed=config.seed,
+            shuffle=True,
+        )
+        collator = DiffusionCollator(
+            processor=processor,
+            image_size=config.image_size,
+            condition_prefix=config.condition_prefix,
+            condition_suffix=config.condition_suffix,
+            text_condition_dropout_prob=config.text_condition_dropout_prob,
+            condition_max_seq_len=config.condition_max_seq_len,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collator,
+            num_workers=config.num_workers,
+            pin_memory=True,
+        )
+    else:
+        sampler = DistributedSampler(
+            dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True, seed=config.seed
+        )
+        collator = DiffusionCollator(
+            processor=processor,
+            image_size=config.image_size,
+            condition_prefix=config.condition_prefix,
+            condition_suffix=config.condition_suffix,
+            text_condition_dropout_prob=config.text_condition_dropout_prob,
+            condition_max_seq_len=config.condition_max_seq_len,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            collate_fn=collator,
+            num_workers=config.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
 
     # VAE
     codec: FrozenVAECodec | None = None
