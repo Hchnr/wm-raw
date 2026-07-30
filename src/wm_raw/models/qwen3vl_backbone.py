@@ -34,7 +34,7 @@ class RMSNorm(nn.Module):
         x = x.float()
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(input_dtype)
+        return self.weight * x.to(input_dtype)
 
 
 class TextAttention(nn.Module):
@@ -107,9 +107,12 @@ class TextAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Prepend external K/V for cross_kv_down
+        # Prepend external K/V for cross_kv_concat
         if external_kv is not None:
             ext_k, ext_v = external_kv  # [B, Hkv, K, D]
+            # Apply k_norm to external K (matches online: k_norm normalizes both
+            # native and external keys before they share one softmax)
+            ext_k = self.k_norm(ext_k)
             k = torch.cat([ext_k, k], dim=2)  # [B, Hkv, K+S, D]
             v = torch.cat([ext_v, v], dim=2)  # [B, Hkv, K+S, D]
 
@@ -119,9 +122,12 @@ class TextAttention(nn.Module):
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
         # Scaled dot-product attention
+        # Use is_causal=True when no explicit mask and no external KV (VLM causal path)
+        use_causal = attention_mask is None and external_kv is None
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attention_mask,
+            is_causal=use_causal,
             scale=self.scaling,
         )  # [B, H, S, D]
 

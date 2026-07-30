@@ -2,16 +2,21 @@
 
 Assembles:
 - ContinuousTokenProjector (latent → hidden)
-- SinusoidalTimestepEmbedding + timestep conditioner
-- Decoder layers (shared architecture with VLM but separate weights)
+- SinusoidalTimestepEmbedding + timestep conditioner (input_add)
+- AdaLN-Zero per-layer modulation
+- Decoder layers with external KV (cross_kv_concat)
 - Output head (hidden → latent prediction)
 
 Uses flow matching: predicts velocity v = noise - clean.
+
+Timestep conditioning is dual:
+  1. input_add: time_conditioner(time_hidden) added to all tokens before layers
+  2. adaln_zero: per-layer adaptive modulation (shift/scale/gate)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -109,11 +114,14 @@ class StateDiffusionBranch(nn.Module):
     """Diffusion branch for image latent generation via flow matching.
 
     Architecture:
-        1. Patchify VAE latents → token sequence
-        2. Project tokens into hidden dimension
-        3. Add timestep conditioning (input_add or adaln)
-        4. Run through decoder layers with cross-attention from VLM
-        5. Project back to latent dimension (velocity prediction)
+        1. Project patchified latent tokens into hidden dimension
+        2. Add 2D sincos position embedding (based on patch grid)
+        3. Add timestep conditioning (input_add: broadcast to all tokens)
+        4. Run through decoder layers with AdaLN-Zero + external KV
+        5. Final norm → output head (velocity prediction)
+
+    Supports variable latent sizes (resolution buckets): the patch grid
+    dimensions (patch_h, patch_w) are passed at forward time, not fixed.
     """
 
     def __init__(
@@ -125,14 +133,8 @@ class StateDiffusionBranch(nn.Module):
         self.config = config
         self.latent_config = latent_config
 
-        # Patchified token dimensions
-        patch_h = latent_config.latent_height // latent_config.patch_size
-        patch_w = latent_config.latent_width // latent_config.patch_size
-        token_dim = (
-            latent_config.patch_size ** 2 * latent_config.latent_channels
-        )
-        self.num_latent_tokens = patch_h * patch_w
-        self.token_dim = token_dim
+        # Token dimension: P*P*C (e.g. 2*2*16 = 64)
+        token_dim = latent_config.token_dim
 
         # Input projection: latent token → hidden (no normalization, matches online)
         self.input_proj = ContinuousTokenProjector(
@@ -144,7 +146,7 @@ class StateDiffusionBranch(nn.Module):
             frequency_dim=config.timestep_frequency_dim,
             hidden_size=config.hidden_size,
         )
-        # Timestep → hidden additive conditioning
+        # Timestep → hidden additive conditioning (input_add)
         self.time_conditioner = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
         # Position embedding for latent grid (BAGEL-style frozen 2D sincos table)
@@ -152,8 +154,6 @@ class StateDiffusionBranch(nn.Module):
             max_num_patch_per_side=latent_config.max_position_size,
             hidden_size=config.hidden_size,
         )
-        self._patch_h = patch_h
-        self._patch_w = patch_w
 
         # Decoder layers
         self.layers = nn.ModuleList([
@@ -168,7 +168,7 @@ class StateDiffusionBranch(nn.Module):
             for _ in range(config.num_hidden_layers)
         ])
 
-        # AdaLN-Zero per layer (optional, for adaln_zero timestep conditioning)
+        # AdaLN-Zero per layer
         self.adaln_layers = nn.ModuleList([
             AdaLNZero(config.hidden_size) for _ in range(config.num_hidden_layers)
         ])
@@ -188,14 +188,18 @@ class StateDiffusionBranch(nn.Module):
 
     def prepare_inputs(
         self,
-        noisy_tokens: Tensor,  # [B, num_tokens, token_dim] — already patchified noisy tokens
+        noisy_tokens: Tensor,  # [B, num_tokens, token_dim]
         timesteps: Tensor,  # [B]
+        patch_h: int,  # patch grid height (latent_h / patch_size)
+        patch_w: int,  # patch grid width (latent_w / patch_size)
     ) -> tuple[Tensor, Tensor]:
-        """Project noisy tokens and apply timestep conditioning.
+        """Project noisy tokens and apply position + timestep conditioning.
 
         Args:
             noisy_tokens: [B, num_tokens, token_dim] already patchified
             timesteps: [B] flow matching timesteps
+            patch_h: height of patch grid
+            patch_w: width of patch grid
 
         Returns:
             hidden: [B, num_tokens, D] — ready for decoder layers
@@ -206,72 +210,101 @@ class StateDiffusionBranch(nn.Module):
         # 1. Project to hidden dimension: [B, num_tokens, D]
         hidden = self.input_proj(noisy_tokens)
 
-        # 2. Add position embedding (BAGEL-style indexing)
+        # 2. Add position embedding (BAGEL-style: row * max_pos + col indexing)
         pos_ids = self.latent_position_embedding.make_position_ids(
-            self._patch_h, self._patch_w, batch
+            patch_h, patch_w, batch
         ).to(hidden.device)
         pos_embed = self.latent_position_embedding(pos_ids)  # [B, num_tokens, D]
         hidden = hidden + pos_embed.to(hidden.dtype)
 
-        # 3. Timestep conditioning
+        # 3. Timestep conditioning — input_add (only if not using adaln_zero)
         time_hidden = self.time_embedder(timesteps)  # [B, D]
-        # Add timestep to all token positions
-        time_cond = self.time_conditioner(time_hidden)  # [B, D]
-        hidden = hidden + time_cond.unsqueeze(1)  # [B, num_tokens, D]
+        if self.latent_config.timestep_conditioning == "input_add":
+            time_cond = self.time_conditioner(time_hidden)  # [B, D]
+            hidden = hidden + time_cond.unsqueeze(1)  # [B, num_tokens, D]
 
         return hidden, time_hidden
 
     def forward(
         self,
-        noisy_latent: Tensor,  # [B, num_tokens, token_dim] — patchified noisy tokens
+        noisy_latent: Tensor,  # [B, num_tokens, token_dim]
         timesteps: Tensor,  # [B]
-        cross_attention_contexts: list[Tensor] | None = None,  # VLM hidden states
-        cross_attention_fn=None,  # CrossAttentionStack.condition_layer
-        attention_mask: Optional[Tensor] = None,  # [B, 1, S, S]
-        cross_attention_mask: Optional[Tensor] = None,  # [B, 1, S_diff, S_vlm]
+        patch_h: int,  # patch grid height
+        patch_w: int,  # patch grid width
+        cross_attention_stack=None,  # CrossAttentionStack instance
+        vlm_hidden_states: Sequence[Tensor] | None = None,
+        attention_mask: Optional[Tensor] = None,  # [B, 1, S, S+K] combined mask
+        cross_attention_mask: Optional[Tensor] = None,  # unused for now
     ) -> Tensor:
         """Full diffusion forward: noisy tokens → velocity prediction.
+
+        Uses cross_kv_concat: VLM context K/V are projected and concatenated
+        to self-attention K/V inside each decoder layer.
 
         Args:
             noisy_latent: [B, num_tokens, token_dim] patchified noisy tokens
             timesteps: [B] timestep values in [0, 1]
-            cross_attention_contexts: VLM hidden states (list, indexed by layer map)
-            cross_attention_fn: callable(layer_idx, hidden, contexts, mask) → hidden
-            attention_mask: self-attention mask for diffusion tokens
-            cross_attention_mask: mask for cross-attention to VLM
+            patch_h: height of patch grid (varies per resolution bucket)
+            patch_w: width of patch grid (varies per resolution bucket)
+            cross_attention_stack: CrossAttentionStack for projecting VLM context
+            vlm_hidden_states: VLM hidden states (list, indexed by layer map)
+            attention_mask: combined self+cross attention mask [B, 1, S, K+S]
+            cross_attention_mask: unused placeholder
 
         Returns:
             prediction: [B, num_tokens, token_dim] — velocity prediction
         """
         # Prepare inputs (project + pos embed + timestep cond)
-        hidden, time_hidden = self.prepare_inputs(noisy_latent, timesteps)
+        hidden, time_hidden = self.prepare_inputs(noisy_latent, timesteps, patch_h, patch_w)
         batch, num_tokens, _ = hidden.shape
 
-        # Build position IDs for MRoPE (simple 1D positions for latent tokens)
-        # Use same position ID for all 3 axes (no temporal/spatial distinction in latent)
-        pos_ids = torch.arange(
-            num_tokens, device=hidden.device, dtype=torch.long
-        ).unsqueeze(0).expand(batch, -1)  # [B, S]
-        # Expand to [3, B, S] for MRoPE
-        position_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)  # [3, B, S]
+        # Build MRoPE position IDs for latent tokens: [3, B, num_tokens]
+        # Online uses 2D grid: temporal=0, height=row_idx, width=col_idx
+        # This encodes spatial structure into the rotary embeddings.
+        device = hidden.device
+        temporal_ids = torch.zeros(num_tokens, device=device, dtype=torch.long)
+        row_ids = torch.arange(patch_h, device=device, dtype=torch.long).repeat_interleave(patch_w)
+        col_ids = torch.arange(patch_w, device=device, dtype=torch.long).repeat(patch_h)
+        position_ids = torch.stack(
+            [temporal_ids, row_ids, col_ids], dim=0
+        ).unsqueeze(1).expand(-1, batch, -1)  # [3, B, num_tokens]
         cos, sin = self.rotary_emb(position_ids)
+
+        # Build combined attention mask for cross_kv_concat.
+        # Online model builds a 4D all-zeros mask [B, 1, S_q, S_ext+S_self].
+        # Must use 4D to match SDPA kernel dispatch for exact numerical alignment.
+        combined_mask = attention_mask
+        if combined_mask is None and cross_attention_stack is not None and vlm_hidden_states is not None:
+            vlm_seq_len = vlm_hidden_states[0].shape[1]
+            combined_mask = torch.zeros(
+                batch, 1, num_tokens, vlm_seq_len + num_tokens,
+                device=hidden.device, dtype=hidden.dtype,
+            )
+
+        # Pre-project all VLM context K/V outside the layer loop.
+        # This avoids dynamo recompilation per diffusion_layer_idx.
+        all_external_kv: list[tuple[Tensor, Tensor]] | None = None
+        if cross_attention_stack is not None and vlm_hidden_states is not None:
+            all_external_kv = cross_attention_stack.project_all_context_kv(
+                vlm_hidden_states,
+                target_device=hidden.device,
+                target_dtype=hidden.dtype,
+            )
 
         # Run decoder layers
         for layer_idx, (layer, adaln) in enumerate(zip(self.layers, self.adaln_layers)):
             # Compute AdaLN params from timestep
             adaln_params = adaln(time_hidden)
 
-            # Apply cross-attention if available
-            if cross_attention_fn is not None and cross_attention_contexts is not None:
-                hidden = cross_attention_fn(
-                    layer_idx, hidden, cross_attention_contexts, cross_attention_mask
-                )
+            # Retrieve pre-projected K/V for this layer
+            external_kv = all_external_kv[layer_idx] if all_external_kv is not None else None
 
-            # Decoder layer with AdaLN modulation
+            # Decoder layer with AdaLN modulation + external KV
             hidden = layer(
                 hidden,
-                attention_mask=attention_mask,
+                attention_mask=combined_mask,
                 position_embeddings=(cos, sin),
+                external_kv=external_kv,
                 adaln_params=adaln_params,
             )
 

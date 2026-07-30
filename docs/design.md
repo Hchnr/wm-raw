@@ -1,7 +1,8 @@
 # wm-raw 设计文档
 
-> 目标：构建一个静态、可读、CUDAGraph-ready 的 World Model 训练 codebase，
-> 模型结构对齐 training_code 中 `Qwen3VLBagelModel`，优先支持 GPIC 数据 + VLM/State Diffusion 分支。
+> 目标：构建一个可读、compile-ready 的 World Model 训练 codebase，
+> 模型结构对齐 wm-training 中 `Qwen3VLBagelModel`，优先支持 GPIC 数据 + State Diffusion 分支。
+> 训练栈：PyTorch FSDP2 + DCP + torchrun + bf16 + torch.compile。
 
 ---
 
@@ -9,85 +10,103 @@
 
 | 维度 | 说明 |
 |------|------|
-| **数值对齐** | 给定相同的 checkpoint 和输入，forward/loss 数值必须 bit-exact（bf16 精度内）|
-| **静态化** | 所有 tensor 路径的 shape 在 compile-time 确定，不使用 `nonzero`/`.item()`/`tolist()`/动态 indexing |
-| **CUDAGraph 友好** | 最终可在非 FSDP 场景（如 DDP + CUDAGraph）下 capture 整个 forward+backward |
+| **数值对齐** | 给定相同 checkpoint 和输入，forward/loss 数值 bit-exact（bf16 精度内）|
+| **compile 友好** | torch.compile(mode="default") 可覆盖完整 forward+backward |
 | **可读性** | 单文件 < 500 行，模块职责单一，关键 tensor 操作有 shape 注释 |
-| **最小范围** | 本期只实现 GPIC 数据的 VLM + State Diffusion 路径（不含 action、trajectory） |
+| **最小范围** | 本期只实现 GPIC 数据的 State Diffusion 路径（VLM 作为 condition encoder） |
+| **生产对齐** | 对标线上 config：`cross_kv_concat` + `adaln_zero` + resolution buckets + logit-normal |
 
 ---
 
-## 2. 当前 codebase 问题分析
+## 2. 线上配置摘要（对齐目标）
 
-### 2.1 可读性问题
-- `modeling.py` 3467 行，混杂了 VLM backbone 加载、视觉特征提取、cross-attention、diffusion branch、loss 计算
-- 大量 `_call_first_supported_signature` / `_backbone_feature_extractor` 等兼容性 workaround，为了适配不同 transformers 版本
-- 通过运行时 monkey-patch `attention.forward` 实现 cross_kv_concat（`_forward_qwen3vl_decoder_layer_cross_kv_concat`）
-- 模块间通过 `Mapping[str, Any]` 字典传递，缺乏类型信息
+当前线上使用的配置关键参数：
 
-### 2.2 静态化问题
-- transformers 的 Qwen3VL 实现中 `compute_3d_position_ids` 使用 `.item()`，vision model 使用 `.tolist()`
-- 当前通过 `torch.compiler.disable` 包装绕过，不是根本解决
-- `_deepstack_process` 中 boolean indexing → cumsum+gather 的 patch 是编译期 workaround
+```yaml
+model:
+  vlm_path: Qwen3-VL-4B-Instruct
+  diffusion_path: Qwen3-VL-2B-Instruct
+  communication_policy: cross_kv_concat        # VLM KV concat 到 self-attn
+  layer_mapping_policy: middle_n
+  hidden_state_layer_offset: 1
+  cross_attention_gate_init: 0.01
+  latent:
+    objective: flow_matching
+    prediction_type: flow
+    timestep_shift: 1.0
+    timestep_sampling:
+      type: logit_normal                       # NOT uniform
+      mean: 0.0
+      std: 1.0
+    timestep_conditioning: adaln_zero          # AdaLN-Zero modulation
+    tokenization: patchified
+    patch_size: 2
+    position_embedding: bagel_2d_sincos
+    max_position_size: 64
 
-### 2.3 架构耦合
-- VLM backbone 通过 `AutoModelForImageTextToText.from_pretrained` 加载，整个 transformers 模型树成为依赖
-- Diffusion backbone 同样如此，加载后再定位 layers/norm/rotary 等子模块
-- Cross attention 的 KV projection 与 layer mapping 逻辑分散在多处
+data:
+  resolution_buckets:
+    sizes: [[512,512], [448,608], [608,448], [416,640], ...]
+  tasks:
+    - cfg_dropout_mode: sentinel_only
+      text_condition_dropout_prob: 0.1
+
+multitask:
+  vlm_microbatches_per_step: 0                 # VLM only as condition encoder
+  diffusion_microbatches_per_step: 1
+  trainable_mode: diffusion
+  train_diffusion_backbone: true
+
+optimizer:
+  adapter_learning_rate: 1.0e-4
+  diffusion_learning_rate: 1.0e-4              # same as adapter
+  vlm_learning_rate: 0.0                       # VLM frozen
+  fused: true
+
+training:
+  torch_compile: {enabled: true, mode: default, dynamic: false}
+```
 
 ---
 
-## 3. 新 Codebase 目录结构
+## 3. Codebase 目录结构
 
 ```
 wm-raw/
 ├── configs/
-│   └── gpic_vlm_diffusion.yaml          # 对标当前 v1.95 config
+│   └── gpic_vlm_diffusion.yaml
 ├── docs/
 │   └── design.md                         # 本文档
 ├── src/
 │   └── wm_raw/
 │       ├── __init__.py
 │       ├── config.py                     # 全局配置 dataclass（强类型）
-│       │
+│       ├── diffusion.py                  # Flow matching + timestep sampling
+│       ├── checkpoint.py                 # 权重加载（HF / online DCP 映射）
+│       ├── training.py                   # FSDP2 训练循环
+│       ├── train.py                      # CLI 入口
 │       ├── models/
-│       │   ├── __init__.py
-│       │   ├── qwen3vl_backbone.py       # Qwen3-VL transformer blocks（自包含实现）
-│       │   ├── vision_encoder.py         # ViT / visual 前端（静态 shape）
-│       │   ├── vlm.py                    # VLM 分支：embed → layers → lm_head
-│       │   ├── diffusion_branch.py       # State diffusion 分支
-│       │   ├── cross_attention.py        # Cross-attention stack（独立文件）
-│       │   ├── adaln.py                  # AdaLN-Zero timestep conditioning
-│       │   ├── embeddings.py             # Latent codec、position embeddings
-│       │   ├── rope.py                   # MRoPE 实现（静态化，无 .item()）
-│       │   └── model.py                  # 顶层 WorldModel：组装 VLM + Diffusion
-│       │
+│       │   ├── model.py                  # WorldModel 顶层组装
+│       │   ├── vlm.py                    # VLM 分支（condition encoder）
+│       │   ├── diffusion_branch.py       # StateDiffusionBranch + DiffusionDecoderLayer
+│       │   ├── cross_attention.py        # CrossAttentionStack（cross_kv_concat）
+│       │   ├── adaln.py                  # AdaLN-Zero + SinusoidalTimestepEmbedding
+│       │   ├── embeddings.py             # patchify/unpatchify + BagelGridPositionEmbedding
+│       │   ├── qwen3vl_backbone.py       # DecoderLayer, TextAttention, TextMLP, RMSNorm
+│       │   ├── rope.py                   # MRoPE（text）+ VisionRotaryEmbedding
+│       │   └── vision_encoder.py         # Qwen3-VL ViT
 │       ├── data/
-│       │   ├── __init__.py
-│       │   ├── gpic_dataset.py           # GPIC prepared dataset 加载
-│       │   ├── collator.py               # VLM / Diffusion collator
-│       │   └── schedule.py               # Deterministic microbatch schedule
-│       │
-│       ├── training/
-│       │   ├── __init__.py
-│       │   ├── trainer.py                # 训练循环主逻辑
-│       │   ├── optimizer.py              # 分组 optimizer 构建
-│       │   ├── distributed.py            # FSDP2 / DDP 设置
-│       │   ├── ema.py                    # EMA manager
-│       │   └── checkpoint.py             # checkpoint save/load
-│       │
+│       │   ├── dataset.py / prepared_dataset.py
+│       │   └── collator.py
 │       ├── vae/
-│       │   ├── __init__.py
-│       │   └── frozen_codec.py           # Frozen BAGEL VAE（encode only）
-│       │
+│       │   └── frozen_codec.py           # Frozen BAGEL VAE
 │       └── utils/
-│           ├── __init__.py
-│           └── diagnostics.py            # Tensor stats / logging utilities
-│
+│           ├── ema.py
+│           └── diagnostics.py
 ├── scripts/
-│   └── train.py                          # 入口脚本
-├── pyproject.toml
-└── README.md
+│   ├── train.py
+│   └── align_check.py                   # 数值对齐验证脚本
+└── pyproject.toml
 ```
 
 ---
@@ -97,408 +116,326 @@ wm-raw/
 ### 4.1 总览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    WorldModel                            │
-│                                                         │
-│  ┌──────────────┐                ┌───────────────────┐  │
-│  │  VLMBranch   │                │ StateDiffusion    │  │
-│  │              │    cross-attn  │    Branch         │  │
-│  │  VisionEnc   │───────────────▶│                   │  │
-│  │  TextEmbed   │  (KV from VLM) │  LatentEmbed     │  │
-│  │  QwenLayers  │                │  QwenLayers      │  │
-│  │  LMHead      │                │  AdaLN + Gate    │  │
-│  │              │                │  OutputHead      │  │
-│  └──────────────┘                └───────────────────┘  │
-│                                                         │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │  CrossAttentionStack                               │ │
-│  │  Per-layer: K_proj, V_proj, Gate (from VLM→Diff)   │ │
-│  └────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       WorldModel                             │
+│                                                             │
+│  ┌──────────────┐                ┌────────────────────────┐ │
+│  │  VLMBranch   │                │  StateDiffusionBranch  │ │
+│  │  (frozen)    │  cross_kv_concat│                        │ │
+│  │              │────────────────▶│  LatentEmbed + PosEmb  │ │
+│  │  VisionEnc   │  KV concat to  │  Timestep(input_add)   │ │
+│  │  TextEmbed   │  self-attn KV  │  AdaLN-Zero per layer  │ │
+│  │  QwenLayers  │                │  DiffusionDecoderLayers│ │
+│  │  (36 layers) │                │  (28 layers)           │ │
+│  └──────────────┘                │  OutputHead            │ │
+│                                  └────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  CrossAttentionStack (28 adapters)                     │ │
+│  │  Per-layer: context_norm → k_proj, v_proj              │ │
+│  │  (q_proj/o_proj/gate unused in cross_kv_concat mode)   │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 VLM Branch (`vlm.py`)
+### 4.2 VLM Branch（condition encoder）
 
-**职责**：接收 text tokens + visual tokens，产出 hidden states（供 cross attention）和 AR loss。
+线上配置 `vlm_learning_rate: 0.0`，VLM 完全冻结，仅作为 condition encoder。
 
 ```python
 class VLMBranch(nn.Module):
-    """Qwen3-VL 4B VLM backbone for conditioning.
-
-    Produces:
-      - ar_loss: cross-entropy on text tokens
-      - hidden_states: List[Tensor]  # [B, S_vlm, D_vlm] per selected layer
-    """
-
-    def __init__(self, config: VLMConfig):
-        # vision_encoder: VisionEncoder
-        # embed_tokens: nn.Embedding
-        # layers: nn.ModuleList[QwenDecoderLayer]  (N=36 for 4B)
-        # norm: RMSNorm
-        # lm_head: nn.Linear
-        ...
-
-    def forward(
-        self,
-        input_ids: Tensor,          # [B, S_vlm]
-        pixel_values: Tensor,       # [B, N_patches, C_patch]
-        image_grid_thw: Tensor,     # [B, 3]  (static: 固定 image size → 固定 grid)
-        attention_mask: Tensor,     # [B, S_vlm]
-        position_ids: Tensor,       # [3, B, S_vlm]  (MRoPE: temporal, height, width)
-        labels: Optional[Tensor],   # [B, S_vlm]
-    ) -> VLMOutput:
-        ...
-```
-
-**关键设计决策**：
-- **不依赖 transformers 的 model 类**，自己用 `QwenDecoderLayer` 堆叠
-- `image_grid_thw` 在 fixed_seqlen 模式下是常量（256x256 图 → 固定 patch 数），编译时可折叠
-- 中间 hidden states 通过 layer index 列表抽取（`hidden_state_layer_offset=1` → 取 layer[i+1] 给 diffusion layer[i]）
-
-### 4.3 Qwen3-VL Decoder Layer (`qwen3vl_backbone.py`)
-
-**核心复用单元**：VLM 和 Diffusion 共享同一套 layer 实现，只是参数不同。
-
-```python
-class QwenDecoderLayer(nn.Module):
-    """Single Qwen3-VL transformer block.
-
-    Components:
-      - input_layernorm: RMSNorm
-      - self_attn: QwenAttention (GQA with MRoPE)
-      - post_attention_layernorm: RMSNorm
-      - mlp: QwenMLP (SwiGLU)
-
-    Shape annotations:
-      hidden: [B, S, D]
-      attention_mask: [B, 1, S, S+S_kv]  (causal or custom)
+    """Qwen3-VL 4B — 产出 hidden states 供 cross attention。
+    
+    输入: condition text tokens + (可选) image
+    输出: hidden_states: List[Tensor] [num_layers+1 × (B, S_vlm, 2560)]
     """
 ```
 
-**静态化要点**：
-- Attention 计算使用 `F.scaled_dot_product_attention`，不走 eager math path
-- RoPE 的 cos/sin 表预计算为固定 buffer（max_seq_len 已知），forward 时只做 slice
-- 无动态 shape 操作：pad_to_max、attention_mask 预构建
+- 36 层 Qwen3-VL decoder + vision encoder
+- 中间 hidden states 按 `layer_map + offset` 选取给 diffusion 的每一层
+- 不计算 AR loss（线上 `vlm_microbatches_per_step: 0`）
 
-### 4.4 Vision Encoder (`vision_encoder.py`)
+### 4.3 Cross Attention — `cross_kv_concat` 策略
 
-```python
-class VisionEncoder(nn.Module):
-    """Qwen3-VL ViT (675M params in 4B model).
+**核心区别于 `cross_kv_down`**：
 
-    固定输入：
-      - image_size=256 → patch_size=14 → grid=(1, 18, 18) → 324 visual tokens
-      - 由于 vlm_image_size=256 固定，visual token 数量在编译期确定
-
-    输出：[B, 324, D_vision]，经过 merger 后维度对齐到 D_text
-    """
-```
-
-**静态化**：
-- 原始 transformers 实现中 `_get_vision_grid` 使用 `.tolist()`
-- 我们对固定 image_size 直接硬编码 grid shape，消除动态计算
-
-### 4.5 Diffusion Branch (`diffusion_branch.py`)
+- `cross_kv_down`：独立的 cross-attention 块，有自己的 Q/K/V/O proj + gate，在 self-attn 之后做 gated residual add
+- `cross_kv_concat`：VLM context 只经过 `context_norm → k_proj / v_proj`，产出的 K/V **直接 prepend 到 self-attention 的 K/V** 中
 
 ```python
-class StateDiffusionBranch(nn.Module):
-    """Image latent flow-matching diffusion，conditioned on VLM hidden states.
+# cross_kv_concat 数据流（在 diffusion self-attention 内部）：
+Q = self_attn.q_proj(diffusion_hidden)           # [B, H, S_diff, D]
+K_self = self_attn.k_proj(diffusion_hidden)      # [B, H_kv, S_diff, D]
+V_self = self_attn.v_proj(diffusion_hidden)      # [B, H_kv, S_diff, D]
 
-    输入：
-      - noisy_latent: [B, S_lat, D_lat]   # VAE latent tokens (patchified)
-      - timesteps: [B]                     # flow matching t ∈ [0, 1]
-      - vlm_hidden_states: List[Tensor]    # cross-attention 条件
+K_ext, V_ext = adapter.project_context_kv(vlm_hidden)  # [B, H_kv, S_vlm, D]
 
-    输出：
-      - prediction: [B, S_lat, D_lat]      # velocity field v(x_t, t)
-      - loss: scalar MSE
-    """
+K = cat(K_ext, K_self, dim=-2)  # [B, H_kv, S_vlm+S_diff, D]
+V = cat(V_ext, V_self, dim=-2)  # [B, H_kv, S_vlm+S_diff, D]
 
-    def __init__(self, config: DiffusionConfig):
-        # latent_in_proj: nn.Linear(D_lat_raw, D_diff)
-        # time_embedder: TimestepEmbedder → [B, D_time]
-        # time_conditioner: nn.Linear(D_time, D_diff)  # input_add mode
-        # peer_conditioner: PeerConditioner  (gate-based)
-        # layers: nn.ModuleList[QwenDecoderLayer]  (N=28 for 2B)
-        # norm: RMSNorm
-        # output_head: nn.Linear(D_diff, D_lat_raw)
-        ...
+out = SDPA(Q, K, V, mask=combined_mask)  # 一次统一 attention
 ```
 
-**数据流**（对齐 `_forward_single_diffusion_branch` → `_run_prepared_single_diffusion_branch`）：
-1. VAE encode → patchify → `latent_in_proj`
-2. Timestep embed + `time_conditioner` → add to hidden
-3. 对每个 decoder layer：
-   - Cross attention inject VLM KV
-   - Self attention (causal=False for diffusion)
-   - MLP
-4. `norm` → `output_head` → velocity prediction
-5. Flow matching MSE loss
+**关键**：`cross_kv_concat` 模式下 adapter 的 `q_proj`、`o_proj`、`gate` 参数不使用（已被 freeze）。只有 `context_norm`、`k_proj`、`v_proj` 参与计算。
 
-### 4.6 Cross Attention (`cross_attention.py`)
+### 4.4 Layer Mapping
 
-当前 config 指定 `communication_policy: cross_kv_down`（K/V 从 VLM 映射到 diffusion space）。
+`layer_mapping_policy: middle_n` + `hidden_state_layer_offset: 1`：
+- VLM 36 层，Diffusion 28 层
+- `middle_n`：start = (36-28)//2 = 4，diffusion layer[i] → VLM layer[4+i]
+- `offset=1`：取 VLM layer[4+i+1] 的输出（即 layer 之后的 hidden state）
+
+### 4.5 Timestep Conditioning（双重）
+
+线上使用 **input_add + adaln_zero** 双重 conditioning：
+
+**1. Input Add（全局，在 decoder layers 之前）：**
+```python
+time_hidden = time_embedder(timesteps)           # [B, D]
+time_cond = time_conditioner(time_hidden)        # [B, D]  (Linear, no bias)
+hidden = hidden + time_cond[:, None]             # broadcast 到所有 token
+```
+
+**2. AdaLN-Zero（per-layer，modulate each decoder layer）：**
+```python
+class AdaLNZero:
+    # Per layer: SiLU → Linear(D, 6D), zero-initialized
+    # Produces: shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp
+
+# In DiffusionDecoderLayer:
+normed = input_layernorm(x) * (1 + scale_attn) + shift_attn  # modulated norm
+attn_out = self_attn(normed, ...)
+x = x + gate_attn * attn_out                                  # gated residual
+
+normed = post_attn_layernorm(x) * (1 + scale_mlp) + shift_mlp
+mlp_out = mlp(normed)
+x = x + gate_mlp * mlp_out
+```
+
+Zero-init 意味着训练开始时 diffusion branch 退化为标准 pretrained LLM layer。
+
+### 4.6 Latent Tokenization + Position Embedding
 
 ```python
-class CrossAttentionStack(nn.Module):
-    """Per-layer cross-attention from diffusion to VLM.
+# VAE (BAGEL AE, downsample 8x):
+#   512x512 image → [B, 16, 64, 64] latent
+#   448x608 image → [B, 16, 56, 76] latent
+#   (实际 stride=16 with temporal_patch=2: H_lat = H_img/8, W_lat = W_img/8)
 
-    For each diffusion layer i, maps VLM hidden[layer_map[i]] through:
-      - k_proj: Linear(D_vlm, num_kv_heads * head_dim)
-      - v_proj: Linear(D_vlm, num_kv_heads * head_dim)
-      - gate: learnable scalar (init=0.01)
+# Patchify (patch_size=2):
+#   [B, 16, 64, 64] → [B, 32*32, 2*2*16] = [B, 1024, 64]
+#   [B, 16, 56, 76] → [B, 28*38, 64] = [B, 1064, 64]
 
-    cross_kv_down 策略：
-      diffusion_query @ (k_proj(vlm_hidden)).T → attention → v_proj(vlm_hidden) → gate → add to hidden
-
-    区别于 cross_kv_concat（将 KV 拼接到 self-attention 的 KV 中），
-    cross_kv_down 在 self-attention 之后做独立的 cross-attention add。
-    """
-
-    def __init__(self, config: CrossAttentionConfig):
-        # layers: nn.ModuleList  (一层 per diffusion layer)
-        # 每层包含: k_proj, v_proj, q_proj (from diffusion hidden), o_proj, gate
-        ...
-
-    def condition_layer(
-        self,
-        layer_idx: int,
-        hidden: Tensor,              # [B, S_diff, D_diff]
-        vlm_kv: Tensor,              # [B, S_vlm, D_vlm]
-        attention_mask: Tensor,      # [B, S_diff, S_vlm] or broadcastable
-    ) -> Tensor:
-        """Returns hidden + gate * cross_attn(hidden, vlm_kv)"""
-        ...
+# Position Embedding: BagelGridPositionEmbedding
+#   Frozen lookup table [max_position_size^2, hidden_size]
+#   pos_id = row * max_position_size + col
+#   Added to projected hidden states
 ```
 
-### 4.7 Layer Mapping (`models/model.py` 内部)
+`max_position_size=64` 允许 latent grid 最大 64×64 patches（对应 512×512 图像经 8x 下采样再 2x patchify）。
 
-配置 `layer_mapping_policy: middle_n`：
-- VLM 有 36 层（4B），Diffusion 有 28 层（2B）
-- middle_n 策略：diffusion layer[i] → VLM layer[offset + i]
-- `hidden_state_layer_offset=1`：取 VLM layer[mapped+1] 的输出作为 KV source
+### 4.7 Timestep Sampling — logit-normal
 
-### 4.8 Latent Tokenization
+线上使用 `logit_normal` 而非 uniform：
 
 ```python
-# VAE: 256x256 image → [B, 16, 32, 32] latent
-# Patchify (patch_size=2): → [B, 16*16, 16*4] = [B, 256, 64]
-# latent_in_proj: → [B, 256, D_diff]
+def sample_timesteps_logit_normal(batch_size, *, mean=0.0, std=1.0, shift=1.0):
+    """Sample t ~ sigmoid(Normal(mean, std)), then apply rectified flow shift."""
+    z = torch.randn(batch_size) * std + mean
+    t = torch.sigmoid(z)  # t ∈ (0, 1), concentrated around sigmoid(mean)=0.5
+    if shift != 1.0:
+        t = shift * t / (1 + (shift - 1) * t)
+    return t.clamp(1e-5, 1 - 1e-5)
 ```
 
-Position embedding: `bagel_2d_sincos` 基于 patch grid 的 2D sincos 位置编码。
+logit-normal 相比 uniform 更集中于中间 timestep，训练效率更高。
+
+### 4.8 CFG Dropout（sentinel_only）
+
+`text_condition_dropout_prob: 0.1` + `cfg_dropout_mode: sentinel_only`：
+- 训练时 10% 概率将 condition text 替换为 unconditional sentinel
+- `sentinel_only`：unconditional text = `condition_suffix.strip()` = `"<|wm_predict_image|>"`
+- 推理时用 classifier-free guidance：`pred = uncond + scale * (cond - uncond)`
 
 ---
 
-## 5. 静态化策略
+## 5. 静态化与 compile 策略
 
-### 5.1 消除动态 shape 来源
+### 5.1 Resolution Buckets 下的 compile 策略
 
-| 动态来源 | 当前 workaround | 新方案 |
-|----------|----------------|--------|
-| `compute_3d_position_ids` 中 `.item()` | `torch.compiler.disable` | 预计算固定 position_ids buffer |
-| VisionModel `.tolist()` | `torch.compiler.disable` | 固定 grid，硬编码 reshape 参数 |
-| `_deepstack_process` boolean indexing | cumsum+gather patch | 不需要 deepstack（自己实现 ViT） |
-| 动态 sequence length | `fixed_seqlen` pad/truncate | 从 collator 层保证固定 shape |
-| `attention_mask` 形状不一致 | 运行时判断 ndim | 统一为 `[B, 1, S_q, S_kv]` 4D mask |
+线上使用 7 种 bucket sizes，每种 bucket 产生不同的 latent token 数：
 
-### 5.2 固定 shape 契约
+| Bucket | Latent (H/8) | Patch (÷2) | Tokens |
+|--------|-------------|------------|--------|
+| 512×512 | 64×64 | 32×32 | 1024 |
+| 448×608 | 56×76 | 28×38 | 1064 |
+| 608×448 | 76×56 | 38×28 | 1064 |
+| 416×640 | 52×80 | 26×40 | 1040 |
+| 640×416 | 80×52 | 40×26 | 1040 |
+| 384×704 | 48×88 | 24×44 | 1056 |
+| 704×384 | 88×48 | 44×24 | 1056 |
 
-所有 forward 的 tensor shapes 在配置加载时即确定：
+**compile 策略**：`dynamic=false`，每种 bucket shape 会触发 1 次 recompile，之后缓存。线上设 `cache_size_limit: 16` 足够覆盖 7 种 bucket。同一 batch 内所有 sample 来自同一 bucket（由 `DistributedResolutionBucketBatchSampler` 保证），所以每次 forward 的 shape 是固定的。
+
+### 5.2 compile 兼容设计
+
+| 问题 | 解决 |
+|------|------|
+| 动态 seq_len | 同 batch 同 bucket，compile 缓存多套 |
+| VLM position_ids 的 `.item()` | 由 collator 预计算好再传入 |
+| AdaLN 和 external_kv 的条件分支 | 所有 diffusion layer 总是有 AdaLN + external_kv（不做 None 分支） |
+| Cross-attn KV projection 的 layer_idx 依赖 | 在 layer loop 之前 batch project 所有层 |
+| attention_mask 形状不一致 | 统一为 `[B, 1, S_q, S_kv]` 4D mask（预构建） |
+
+---
+
+## 6. 训练数据流
+
+### 6.1 当前训练模式（diffusion-only）
+
+```
+每步仅 1 个 diffusion microbatch（vlm_microbatches=0）:
+
+1. Collator 准备 batch:
+   - condition: tokenized text + (optional image)
+   - state_target: target image pixels → VAE encode → patchified latent
+   - timesteps: logit_normal sampling
+   - noise: randn_like(clean_tokens)
+
+2. Forward:
+   vlm_hidden = model.vlm_forward(condition)     # frozen, 产出 hidden_states
+   prediction = model.diffusion_forward(
+       noisy_tokens, timesteps,
+       cross_attention_stack=model.cross_attention,
+       vlm_hidden_states=vlm_hidden,
+   )
+
+3. Loss:
+   loss = MSE(prediction, velocity_target)       # state_loss_weight=1.0
+
+4. Backward + optimizer step (only adapter + diffusion params)
+```
+
+### 6.2 CFG Dropout 在 collator 中
 
 ```python
-@dataclass
-class ShapeContract:
-    """编译期可确定的所有 shape 常量"""
-    batch_size: int = 4
-    vlm_seq_len: int = 640          # fixed_seqlen.vlm_max_seq_len
-    condition_seq_len: int = 256     # fixed_seqlen.condition_max_seq_len
-    image_size: int = 256
-    visual_tokens: int = 324         # (256/14)^2 ≈ 324 after merge
-    latent_h: int = 32               # VAE latent height
-    latent_w: int = 32               # VAE latent width
-    latent_channels: int = 16
-    patch_size: int = 2
-    diffusion_seq_len: int = 256     # (32/2) * (32/2) = 256 patched tokens
-    vlm_hidden_dim: int = 3584       # Qwen3-VL-4B
-    diff_hidden_dim: int = 1536      # Qwen3-VL-2B
+if random() < text_condition_dropout_prob:
+    condition_text = "<|wm_predict_image|>"  # sentinel_only mode
+else:
+    condition_text = f"Caption: {caption} <|wm_predict_image|>"
 ```
-
-### 5.3 CUDAGraph Readiness
-
-为后续 CUDAGraph capture 做好准备：
-- **无 Python 控制流依赖 tensor 值**：所有 if/else 只依赖 config 常量
-- **无动态 allocation**：buffer 预分配，mask 预构建
-- **无 NCCL 调用在 capture 区域内**（DDP 模式下 grad sync 在 backward 后）
-- 当前 FSDP2 模式下用 `mode=default`（inductor codegen），未来 DDP 模式可切 `reduce-overhead`
 
 ---
 
-## 6. 从 transformers 加载权重的策略
-
-不依赖 transformers model class，但需要兼容 HF checkpoint format：
+## 7. Optimizer & Schedule
 
 ```python
-def load_qwen3vl_from_hf(path: str, *, model: WorldModel) -> None:
-    """从 HF safetensors 加载权重到自定义模型结构。
+# 两组参数（VLM frozen，不参与优化）:
+param_groups = [
+    {"params": adapter_params, "lr": 1e-4},      # cross_attention k_proj/v_proj/context_norm
+    {"params": diffusion_params, "lr": 1e-4},    # diffusion backbone layers + adaln + output_head
+]
 
-    映射规则：
-      HF: model.language_model.model.layers.{i}.self_attn.q_proj.weight
-      Ours: vlm.layers[i].self_attn.q_proj.weight
+optimizer = torch.optim.AdamW(
+    param_groups,
+    betas=(0.9, 0.95),
+    weight_decay=0.0,
+    fused=True,
+)
 
-      HF: model.visual.{...}
-      Ours: vlm.vision_encoder.{...}
-
-      HF (diffusion backbone): model.language_model.model.layers.{i}.*
-      Ours: diffusion.layers[i].*
-    """
-```
-
-提供一个显式的 state_dict 映射表，而不是运行时动态探测。
-
----
-
-## 7. 数据流设计
-
-### 7.1 GPIC Prepared Dataset
-
-当前 config 使用 `dataset_type: wm_sequence_prepared`，`prepared_view: image_caption`。
-
-数据已经预处理为 tokenized sequences，存储在 safetensors shards 中。
-
-```
-每个 sample 包含:
-  - input_ids: [S_vlm]       (text tokens, 含 image placeholder)
-  - attention_mask: [S_vlm]
-  - labels: [S_vlm]          (AR target, -100 for non-text)
-  - pixel_values: [N, C, H, W]  (原始图片 for VLM visual enc)
-  - image_grid_thw: [N, 3]
-  - target_image: [3, 256, 256]  (diffusion target)
-```
-
-### 7.2 Collator
-
-VLM collator:
-- Pad/truncate to `vlm_max_seq_len=640`
-- Resize image to fixed 256x256（确保 visual_tokens=324）
-
-Diffusion collator:
-- Pad/truncate condition to `condition_max_seq_len=256`
-- VAE encode target_image → patchify → produce `state_target: [B, 256, 64]`
-- Sample timesteps, noise
-
-### 7.3 Training Step
-
-```
-1. VLM microbatch:
-   vlm_output = model.vlm_forward(vlm_batch)
-   ar_loss = vlm_output.loss
-
-2. Diffusion microbatch:
-   # Condition encoding (VLM forward on condition text + image)
-   vlm_hidden = model.vlm_forward(condition_batch).hidden_states
-
-   # VAE encode (outside compile graph)
-   latent = vae.encode(target_image)
-
-   # Diffusion forward
-   diff_output = model.diffusion_forward(latent, vlm_hidden, timesteps)
-   state_loss = diff_output.loss
-
-3. Total loss = vlm_loss_weight * ar_loss + state_loss_weight * state_loss
-4. Backward + optimizer step
+scheduler = constant with warmup(2500 steps)
+grad_clip = 1.0
 ```
 
 ---
 
-## 8. 训练循环设计
+## 8. 数值对齐验证计划
 
-### 8.1 Deterministic Microbatch Schedule
+### 8.1 对齐策略
 
-每步交替：1 VLM microbatch + 1 Diffusion microbatch（对齐当前 config）。
+按 M1/M3 里程碑要求：**相同权重 + 相同输入 → forward 输出 bit-exact**。
 
-### 8.2 Optimizer
+对齐分三级：
+1. **逐层对齐**（单 GPU，固定 seed）：每个模块独立对比
+2. **Forward 对齐**：完整 forward pass 数值一致
+3. **训练对齐**：100 步 loss 对比
 
-三组学习率（对齐现有 config）：
-- `adapter_learning_rate: 1e-4`（cross attention、gate 等新增参数）
-- `diffusion_learning_rate: 1e-5`（diffusion backbone）
-- `vlm_learning_rate: 1e-6`（VLM backbone）
+### 8.2 逐层对齐方案（优先实现）
 
-AdamW, β=(0.9, 0.95), weight_decay=0, max_grad_norm=1.0
+```
+环境：单卡，bf16，固定 seed，不开 FSDP
 
-### 8.3 EMA
+输入：保存一个 fixture batch（tokenized condition + state_target + timesteps + noise）
 
-对 optimizer tracked params 做 EMA（decay=0.9999），存入 checkpoint。
+对比点：
+  ┌─ VLM ─────────────────────────────────────┐
+  │ 1. vision_encoder output                   │
+  │ 2. embed_tokens output                     │
+  │ 3. per-layer hidden state (36 layers)      │
+  └────────────────────────────────────────────┘
+  ┌─ Cross Attention ─────────────────────────┐
+  │ 4. per-layer projected K/V (28 layers)     │
+  └────────────────────────────────────────────┘
+  ┌─ Diffusion ───────────────────────────────┐
+  │ 5. input_proj output                       │
+  │ 6. position_embedding output               │
+  │ 7. time_embedder + time_conditioner output │
+  │ 8. per-layer AdaLN params (28 layers)      │
+  │ 9. per-layer hidden state (28 layers)      │
+  │ 10. final prediction                       │
+  │ 11. loss value                             │
+  └────────────────────────────────────────────┘
 
----
+报告格式：
+  Layer X: max_abs_err=1.2e-7, rel_err=3.4e-6, shape=[B,S,D] ✓
+```
 
-## 9. 可读性规范
+### 8.3 工具设计
 
-### 9.1 代码规范
+两个脚本协作：
 
-- 每个文件 < 500 行（hard limit），超出则拆分
-- 所有 `forward` 方法的输入输出加 shape 注释：
-  ```python
-  def forward(
-      self,
-      hidden: Tensor,          # [B, S, D]
-      attention_mask: Tensor,  # [B, 1, S, S]
-  ) -> Tensor:                 # [B, S, D]
-  ```
-- 关键 reshape/permute 操作附带 shape 变换注释：
-  ```python
-  # [B, H*W, C] → [B, H, W, C] → [B, pH, pS, pW, pS, C] → [B, pH*pW, pS*pS*C]
-  grid = tokens.reshape(batch, height, width, channels)
-  ```
-- 模块 docstring 说明：职责、输入输出、与论文/原始实现的对应关系
+1. `scripts/dump_online_activations.py`：
+   - 加载 wm-training checkpoint
+   - 注册 forward hooks 捕获中间结果
+   - 保存为 `activations.pt`
 
-### 9.2 命名规范
+2. `scripts/align_check.py`：
+   - 加载同一 checkpoint 到 wm-raw
+   - 用相同 fixture 输入做 forward
+   - 逐层对比与 `activations.pt` 的数值差异
+   - 输出对齐报告
 
-- Layer/module 用全称：`self_attention` 而非 `self_attn`（除非对齐 checkpoint key）
-- Tensor 变量名体现含义：`vlm_hidden_states` 而非 `hs`
-- 配置字段用完整描述性名称
+### 8.4 Seed 固定方案
 
-### 9.3 不做的事
-
-- 不做 transformers 版本兼容（`_call_first_supported_signature` 类逻辑全部移除）
-- 不做动态模块发现（`_backbone_feature_extractor` / `_find_layers` 全部移除）
-- 不支持多种 communication_policy 的运行时切换——本期只实现 `cross_kv_down`
-- 不支持 action branch（本期不需要）
-
----
-
-## 10. 数值对齐验证计划
-
-1. **逐层对齐**：加载相同 checkpoint，对比每层 hidden state 的数值差异
-2. **Forward 对齐**：给定相同输入 batch，对比 VLM logits、diffusion prediction
-3. **Loss 对齐**：对比 ar_loss、state_diffusion_loss
-4. **训练对齐**：跑 100 步，对比 loss curve 是否 match（允许 bf16 累积误差）
-
----
-
-## 11. 实施优先级
-
-| 阶段 | 内容 | 预期工作量 |
-|------|------|-----------|
-| P0 | `qwen3vl_backbone.py` + `rope.py`：Qwen3-VL decoder layer 自包含实现 | 2-3 天 |
-| P1 | `vision_encoder.py`：静态化 ViT 实现 | 1-2 天 |
-| P2 | `vlm.py`：VLM 分支组装 + AR loss | 1 天 |
-| P3 | `cross_attention.py` + `diffusion_branch.py`：扩散分支 + cross attn | 2 天 |
-| P4 | `embeddings.py` + `model.py`：latent tokenization + 顶层组装 | 1 天 |
-| P5 | `data/` + `training/`：数据流 + 训练循环 | 2-3 天 |
-| P6 | 权重加载 + 数值对齐验证 | 2 天 |
-| P7 | torch.compile + CUDAGraph 验证 | 1-2 天 |
+```python
+def set_deterministic(seed: int = 42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)  # 部分 op 不支持
+```
 
 ---
 
-## 12. 与现有 Repo 的关键差异总结
+## 9. 与 refactor_v3.md 的 Milestone 对应
 
-| 维度 | 现有 repo (training_code) | 新 repo (wm-raw) |
-|------|--------------------------|-------------------|
-| 模型加载 | `AutoModelForImageTextToText` 继承 | 自包含实现 + HF weight mapping |
-| 可读性 | 3400+ 行单文件 | 多文件，每文件 < 500 行 |
-| 静态化 | 编译期 patch + compiler.disable | 原生静态设计 |
-| 兼容性 | 多 transformers 版本兼容 | 只支持目标 checkpoint format |
-| 灵活性 | 多 communication_policy、多任务 | 只实现 cross_kv_down + GPIC |
-| CUDAGraph | 不支持（FSDP2 冲突） | 设计为 CUDAGraph-ready |
-| 类型安全 | `Mapping[str, Any]` 字典 | 强类型 dataclass + TypedDict |
+| 本文档内容 | 对应 Milestone |
+|-----------|---------------|
+| 模型架构实现（§4） | M1：模型结构迁移 |
+| 数值对齐（§8） | M1 验收 + M3 |
+| 训练循环（§6-7） | M2：跑通训练 |
+| compile 策略（§5） | M2 性能优化 |
+
+---
+
+## 10. 实施优先级（更新）
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| P0 | 模型架构（backbone + cross_attn + adaln + diffusion） | ✅ 已完成 |
+| P1 | 权重加载（HF + online DCP mapping） | ✅ 已完成 |
+| P2 | logit-normal timestep + variable latent sizes | 🔄 进行中 |
+| P3 | 数值对齐工具（align_check.py） | 🔄 进行中 |
+| P4 | FSDP2 训练循环 | ✅ 基本完成 |
+| P5 | Resolution bucket collator | 待完成 |
+| P6 | 2 卡 FSDP 对齐验证 | 待完成 |

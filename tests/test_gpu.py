@@ -183,8 +183,8 @@ def test_torch_compile():
                 pred = compiled_diff(
                     noisy_latent=noisy,
                     timesteps=timesteps,
-                    cross_attention_contexts=vlm_hidden_states,
-                    cross_attention_fn=model.cross_attention.condition_layer,
+                    cross_attention_stack=model.cross_attention,
+                    vlm_hidden_states=vlm_hidden_states,
                 )
         print(f"  Diffusion compile: OK (pred shape={pred.shape})")
     except Exception as e:

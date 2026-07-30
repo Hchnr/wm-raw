@@ -455,20 +455,17 @@ def train_step(
 
     # Forward with autocast
     with torch.amp.autocast("cuda", dtype=compute_dtype):
-        # VLM forward (condition pass, no AR loss for diffusion-only)
-        vlm_output = model.forward_vlm(
-            input_ids=condition["input_ids"],
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-        )
+        output = model({
+            "task_type": "diffusion",
+            "condition": {
+                "input_ids": condition["input_ids"],
+                "attention_mask": causal_mask,
+                "position_ids": position_ids,
+            },
+            "state_target": state_target.to(dtype=compute_dtype),
+        })
 
-        # Diffusion forward
-        diff_output = model.forward_diffusion(
-            state_target=state_target.to(dtype=compute_dtype),
-            vlm_hidden_states=vlm_output.hidden_states,
-        )
-
-    loss = diff_output.loss * config.diffusion_loss_weight
+    loss = output.diffusion_loss * config.diffusion_loss_weight
     loss.backward()
 
     # Gradient clipping
@@ -483,7 +480,7 @@ def train_step(
 
     return {
         "loss": loss.item(),
-        "diffusion_loss": diff_output.loss.item(),
+        "diffusion_loss": output.diffusion_loss.item(),
         "lr": scheduler.get_last_lr()[0],
     }
 
@@ -790,9 +787,12 @@ def run_training(config: TrainingConfig) -> None:
 
     # torch.compile
     if config.compile_enabled:
-        model = torch.compile(model, mode=config.compile_mode)
+        # Compile the root model. train_step calls model(batch) which enters
+        # model.forward — dynamo traces the full VLM + cross_attention + diffusion
+        # graph in one shot, ensuring FSDP2 DTensor dispatch is consistent.
+        model = torch.compile(model, mode=config.compile_mode, dynamic=False)
         if ctx.is_main:
-            logger.info("torch.compile enabled (mode=%s)", config.compile_mode)
+            logger.info("torch.compile enabled (mode=%s, dynamic=False)", config.compile_mode)
 
     # Optimizer & scheduler
     optimizer = build_optimizer(model, config)

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Efficiency comparison: 4 experiments on single-node, 2 GPUs each
-# All 4 experiments run in background (non-blocking) on different GPU pairs
-# Requires 8 GPUs total (GPU 0-1, 2-3, 4-5, 6-7)
+# Efficiency comparison: 3 experiments on single-node, 2 GPUs each
+# All 3 experiments run in background (non-blocking) on different GPU pairs
+# Requires 6 GPUs total (GPU 0-1, 2-3, 4-5)
 #
-# Usage: bash scripts/efficiency_cmp.sh
+# Usage:
+#   bash scripts/efficiency_cmp.sh
+#   BS=8 NW=4 bash scripts/efficiency_cmp.sh
+#
+# Kill all: pkill -f "wm_raw.train"
 
 set -euo pipefail
 
@@ -11,77 +15,78 @@ CONFIG="configs/gpic_image_diffusion.yaml"
 NPROC=2
 MAX_STEPS=1000
 
-echo "=== Launching 4 efficiency experiments (1000 steps each) ==="
+BS=${BS:-4}   # batch_size for all experiments
+NW=${NW:-4}   # num_workers for all experiments
 
-# Exp1: No compile, No CUDAGraph
-echo "[Exp1] No compile, No CUDAGraph (GPU 0,1)"
+echo "=== Launching 3 efficiency experiments (${MAX_STEPS} steps each, bs=${BS} nw=${NW}) ==="
+echo ""
+
+mkdir -p logs
+
+# Exp1: Baseline (no compile, no fused)
+TAG1="exp1_baseline_bs${BS}_nw${NW}"
+echo "[Exp1] Baseline (GPU 0,1)"
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=$NPROC --master_port=29500 -m wm_raw.train \
     --config $CONFIG \
     --max-steps $MAX_STEPS \
     --compile false \
     --compile-mode default \
     --adam-fused false \
-    --output-dir outputs/exp1_no_compile_no_cudagraph \
-    --log-dir logs/exp1_no_compile_no_cudagraph \
+    --batch-size $BS \
+    --num-workers $NW \
+    --output-dir outputs/${TAG1} \
+    --log-dir logs/${TAG1} \
     --wandb-project wm-training \
-    --wandb-name new_repo_exp1-no-compile-no-cudagraph \
-    > logs/exp1_no_compile_no_cudagraph.log 2>&1 &
+    --wandb-name ${TAG1} \
+    > logs/${TAG1}.log 2>&1 &
 PID1=$!
 
-# Exp2: Compile, No CUDAGraph
-echo "[Exp2] Compile, No CUDAGraph (GPU 2,3)"
+# Exp2: Compile
+TAG2="exp2_compile_bs${BS}_nw${NW}"
+echo "[Exp2] Compile (GPU 2,3)"
 CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=$NPROC --master_port=29501 -m wm_raw.train \
     --config $CONFIG \
     --max-steps $MAX_STEPS \
     --compile true \
     --compile-mode default \
     --adam-fused false \
-    --output-dir outputs/exp2_compile_no_cudagraph \
-    --log-dir logs/exp2_compile_no_cudagraph \
+    --batch-size $BS \
+    --num-workers $NW \
+    --output-dir outputs/${TAG2} \
+    --log-dir logs/${TAG2} \
     --wandb-project wm-training \
-    --wandb-name new_repo_exp2-compile-no-cudagraph \
-    > logs/exp2_compile_no_cudagraph.log 2>&1 &
+    --wandb-name ${TAG2} \
+    > logs/${TAG2}.log 2>&1 &
 PID2=$!
 
-# Exp3: Compile + CUDAGraph
-echo "[Exp3] Compile + CUDAGraph (GPU 4,5)"
+# Exp3: Compile + Fused AdamW
+TAG3="exp3_compile_fused_adamw_bs${BS}_nw${NW}"
+echo "[Exp3] Compile + Fused AdamW (GPU 4,5)"
 CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node=$NPROC --master_port=29502 -m wm_raw.train \
     --config $CONFIG \
     --max-steps $MAX_STEPS \
     --compile true \
-    --compile-mode reduce-overhead \
-    --adam-fused false \
-    --output-dir outputs/exp3_compile_cudagraph \
-    --log-dir logs/exp3_compile_cudagraph \
-    --wandb-project wm-raw-ablation \
-    --wandb-name new_repo_exp3-compile-cudagraph \
-    > logs/exp3_compile_cudagraph.log 2>&1 &
-PID3=$!
-
-# Exp4: Compile + CUDAGraph + Fused Optimizer
-echo "[Exp4] Compile + CUDAGraph + Fused (GPU 6,7)"
-CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=$NPROC --master_port=29503 -m wm_raw.train \
-    --config $CONFIG \
-    --max-steps $MAX_STEPS \
-    --compile true \
-    --compile-mode reduce-overhead \
+    --compile-mode default \
     --adam-fused true \
-    --output-dir outputs/exp4_compile_cudagraph_fused \
-    --log-dir logs/exp4_compile_cudagraph_fused \
-    --wandb-project wm-raw-ablation \
-    --wandb-name new_repo_exp4-compile-cudagraph-fused \
-    > logs/exp4_compile_cudagraph_fused.log 2>&1 &
-PID4=$!
+    --batch-size $BS \
+    --num-workers $NW \
+    --output-dir outputs/${TAG3} \
+    --log-dir logs/${TAG3} \
+    --wandb-project wm-training \
+    --wandb-name ${TAG3} \
+    > logs/${TAG3}.log 2>&1 &
+PID3=$!
 
 echo ""
 echo "All experiments launched:"
-echo "  Exp1 PID=$PID1 (GPU 0,1)"
-echo "  Exp2 PID=$PID2 (GPU 2,3)"
-echo "  Exp3 PID=$PID3 (GPU 4,5)"
-echo "  Exp4 PID=$PID4 (GPU 6,7)"
+echo "  Exp1 (baseline)             PID=$PID1  (GPU 0,1)  -> outputs/${TAG1}"
+echo "  Exp2 (compile)              PID=$PID2  (GPU 2,3)  -> outputs/${TAG2}"
+echo "  Exp3 (compile-fused-adamw)  PID=$PID3  (GPU 4,5)  -> outputs/${TAG3}"
 echo ""
 echo "Monitor logs:"
-echo "  tail -f logs/exp{1,2,3,4}_*.log"
+echo "  tail -f logs/${TAG1}.log"
+echo "  tail -f logs/${TAG2}.log"
+echo "  tail -f logs/${TAG3}.log"
 echo ""
 echo "Wait for all to finish:"
-echo "  wait $PID1 $PID2 $PID3 $PID4"
+echo "  wait $PID1 $PID2 $PID3"

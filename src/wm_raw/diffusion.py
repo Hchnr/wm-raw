@@ -1,7 +1,7 @@
 """Flow matching diffusion utilities.
 
 Implements:
-- Timestep sampling (uniform [0, 1] with optional shift)
+- Timestep sampling (uniform, logit-normal, with optional rectified flow shift)
 - Noise scheduling (linear interpolation for flow matching)
 - Flow matching loss (MSE on velocity prediction)
 """
@@ -18,31 +18,56 @@ def sample_timesteps(
     batch_size: int,
     *,
     device: torch.device,
+    sampling_type: str = "logit_normal",
     shift: float = 1.0,
+    mean: float = 0.0,
+    std: float = 1.0,
 ) -> Tensor:
-    """Sample timesteps from uniform distribution with optional logit-normal shift.
-
-    For shift=1.0 (default), this is simply U[0,1].
-    For shift>1.0, applies rectified flow timestep shifting:
-        t_shifted = shift * t / (1 + (shift - 1) * t)
+    """Sample timesteps for flow matching training.
 
     Args:
         batch_size: number of timesteps to sample
         device: target device
-        shift: timestep shift factor (1.0 = no shift)
+        sampling_type: "uniform" or "logit_normal"
+        shift: rectified flow timestep shift (1.0 = no shift)
+        mean: logit-normal mean (only for logit_normal)
+        std: logit-normal std (only for logit_normal)
 
     Returns:
         timesteps: [B] values in (0, 1)
     """
-    t = torch.rand(batch_size, device=device, dtype=torch.float32)
+    if sampling_type == "logit_normal":
+        t = _sample_logit_normal(batch_size, device=device, mean=mean, std=std)
+    elif sampling_type == "uniform":
+        t = torch.rand(batch_size, device=device, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unknown timestep sampling type: {sampling_type!r}")
+
     # Clamp away from exact 0 and 1 for numerical stability
     t = t.clamp(1e-5, 1.0 - 1e-5)
 
+    # Rectified flow shift: t → shift*t / (1 + (shift-1)*t)
     if shift != 1.0:
-        # Rectified flow shift: t → shift*t / (1 + (shift-1)*t)
         t = shift * t / (1.0 + (shift - 1.0) * t)
 
     return t
+
+
+def _sample_logit_normal(
+    batch_size: int,
+    *,
+    device: torch.device,
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> Tensor:
+    """Sample t ~ sigmoid(Normal(mean, std)).
+
+    Produces values in (0, 1) concentrated around sigmoid(mean).
+    With mean=0, std=1: concentrated around t=0.5.
+    """
+    z = torch.randn(batch_size, device=device, dtype=torch.float32)
+    z = z * std + mean
+    return torch.sigmoid(z)
 
 
 def add_flow_noise(

@@ -35,8 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-mode", type=str, default=None,
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode (overrides config)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override data.batch_size from config")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Override data.num_workers from config")
     parser.add_argument("--wandb-project", type=str, default=None,
                         help="Override wandb project name")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="Override wandb entity (team/user)")
     parser.add_argument("--wandb-name", type=str, default=None,
                         help="Override wandb run name")
     parser.add_argument("--log-dir", type=str, default=None,
@@ -166,10 +172,16 @@ def main() -> None:
         tc.compile_mode = args.compile_mode
     if args.wandb_project is not None:
         tc.wandb_project = args.wandb_project
+    if args.wandb_entity is not None:
+        tc.wandb_entity = args.wandb_entity
     if args.wandb_name is not None:
         tc.wandb_name = args.wandb_name
     if args.log_dir is not None:
         tc.log_dir = args.log_dir
+    if args.batch_size is not None:
+        tc.batch_size = args.batch_size
+    if args.num_workers is not None:
+        tc.num_workers = args.num_workers
 
     run_training(tc)
 
