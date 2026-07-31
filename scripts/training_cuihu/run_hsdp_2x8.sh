@@ -20,7 +20,7 @@ LOG_DIR="/share/project/eai_pwm/home/hcr/repos/wm-raw/logs/${RUN_ID}"
 mkdir -p "${LOG_DIR}"
 
 # --- Environment ---
-export PYTHONPATH=/share/project/eai_pwm/home/hcr/repos/wm-raw/src:${PYTHONPATH:-}
+export PYTHONPATH=/share/project/eai_pwm/home/hcr/repos/wm-raw/src:/share/project/eai_pwm/repos/wm-training/src:${PYTHONPATH:-}
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=INFO
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
